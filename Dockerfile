@@ -39,6 +39,9 @@ COPY config /docker/config
 
 RUN chown -R docker:docker /docker
 
+# Make scripts executable
+RUN chmod +x /docker/scripts/*.sh
+
 USER docker
 
 WORKDIR /docker/scripts/
