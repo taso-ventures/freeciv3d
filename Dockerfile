@@ -32,7 +32,7 @@ COPY freeciv /docker/freeciv
 COPY freeciv-proxy /docker/freeciv-proxy
 COPY freeciv-web /docker/freeciv-web
 COPY publite2 /docker/publite2
-COPY LICENSE.txt /docker/LICENSE.txt
+COPY LICENSE.md /docker/LICENSE.md
 
 COPY scripts /docker/scripts
 COPY config /docker/config
