@@ -200,3 +200,166 @@ class CivCom(Thread):
     # queue message for the civserver
     def queue_to_civserver(self, message):
         self.civserver_messages.append(message)
+
+    # LLM-optimized state query methods
+    def handle_state_query(self, player_id, format='full'):
+        """Handle LLM state query requests with different formats"""
+        if format == 'llm_optimized':
+            return self.build_llm_optimized_state(player_id)
+        elif format == 'delta':
+            return self.get_state_delta(player_id)
+        else:
+            return self.get_full_state(player_id)
+
+    def build_llm_optimized_state(self, player_id):
+        """Build compressed state for LLMs (target < 4KB)"""
+        # Basic game state structure for LLM consumption
+        state = {
+            'turn': getattr(self, 'game_turn', 1),
+            'phase': getattr(self, 'game_phase', 'movement'),
+            'player_id': player_id,
+            'strategic': self._build_strategic_view(player_id),
+            'tactical': self._build_tactical_view(player_id),
+            'economic': self._build_economic_view(player_id),
+            'legal_actions': self._get_legal_actions_optimized(player_id)
+        }
+        return state
+
+    def _build_strategic_view(self, player_id):
+        """Build strategic overview for LLM decision making"""
+        return {
+            'score': getattr(self, 'player_score', 0),
+            'cities_count': len(getattr(self, 'player_cities', [])),
+            'units_count': len(getattr(self, 'player_units', [])),
+            'tech_level': getattr(self, 'tech_count', 0),
+            'gold': getattr(self, 'player_gold', 0),
+            'turn_progress': getattr(self, 'turn_progress', 'beginning')
+        }
+
+    def _build_tactical_view(self, player_id):
+        """Build tactical view focusing on immediate unit/city actions"""
+        tactical = {
+            'active_units': [],
+            'cities_needing_orders': [],
+            'visible_threats': [],
+            'exploration_targets': []
+        }
+
+        # Add simplified unit info (limit to 10 most important units)
+        units = getattr(self, 'player_units', [])[:10]
+        for unit in units:
+            if isinstance(unit, dict):
+                tactical['active_units'].append({
+                    'id': unit.get('id'),
+                    'type': unit.get('type'),
+                    'x': unit.get('x'),
+                    'y': unit.get('y'),
+                    'moves_left': unit.get('moves_left', 0),
+                    'can_act': unit.get('moves_left', 0) > 0
+                })
+
+        return tactical
+
+    def _build_economic_view(self, player_id):
+        """Build economic overview for resource management decisions"""
+        return {
+            'gold': getattr(self, 'player_gold', 0),
+            'gold_per_turn': getattr(self, 'gold_income', 0),
+            'research': getattr(self, 'research_progress', 0),
+            'research_target': getattr(self, 'research_target', ''),
+            'total_production': getattr(self, 'total_production', 0),
+            'total_trade': getattr(self, 'total_trade', 0)
+        }
+
+    def _get_legal_actions_optimized(self, player_id):
+        """Pre-compute and cache top legal actions for LLM"""
+        # Simplified legal actions (would normally compute from game state)
+        actions = []
+
+        # Unit movement actions (most common)
+        units = getattr(self, 'player_units', [])
+        for unit in units[:5]:  # Limit to 5 units for size
+            if isinstance(unit, dict) and unit.get('moves_left', 0) > 0:
+                unit_id = unit.get('id')
+                x, y = unit.get('x', 0), unit.get('y', 0)
+
+                # Add movement options
+                for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                    actions.append({
+                        'type': 'unit_move',
+                        'unit_id': unit_id,
+                        'dest_x': x + dx,
+                        'dest_y': y + dy,
+                        'priority': 'medium'
+                    })
+
+        # City production actions
+        cities = getattr(self, 'player_cities', [])
+        for city in cities[:3]:  # Limit to 3 cities
+            if isinstance(city, dict):
+                city_id = city.get('id')
+                actions.append({
+                    'type': 'city_production',
+                    'city_id': city_id,
+                    'production_type': 'warrior',
+                    'priority': 'high'
+                })
+
+        # Research actions
+        if not getattr(self, 'current_research', None):
+            actions.append({
+                'type': 'tech_research',
+                'tech_name': 'pottery',
+                'priority': 'high'
+            })
+
+        # Score and filter actions to top 20
+        return self._score_and_filter_actions(actions, 20)
+
+    def _score_and_filter_actions(self, actions, max_actions):
+        """Score actions and return top N most important"""
+        # Simple scoring based on priority
+        priority_scores = {'high': 3, 'medium': 2, 'low': 1}
+
+        scored_actions = []
+        for action in actions:
+            priority = action.get('priority', 'low')
+            score = priority_scores.get(priority, 1)
+            scored_actions.append((score, action))
+
+        # Sort by score and return top actions
+        scored_actions.sort(key=lambda x: x[0], reverse=True)
+        return [action for score, action in scored_actions[:max_actions]]
+
+    def get_full_state(self, player_id):
+        """Get complete game state (larger format)"""
+        return {
+            'turn': getattr(self, 'game_turn', 1),
+            'phase': getattr(self, 'game_phase', 'movement'),
+            'player_id': player_id,
+            'units': getattr(self, 'player_units', []),
+            'cities': getattr(self, 'player_cities', []),
+            'visible_tiles': getattr(self, 'visible_tiles', []),
+            'players': getattr(self, 'all_players', {}),
+            'techs': getattr(self, 'known_techs', []),
+            'map_info': getattr(self, 'map_info', {})
+        }
+
+    def get_state_delta(self, player_id):
+        """Get state changes since last query"""
+        last_query_time = getattr(self, 'last_state_query_time', 0)
+        current_time = time.time()
+
+        delta = {
+            'turn': getattr(self, 'game_turn', 1),
+            'time_range': [last_query_time, current_time],
+            'new_units': getattr(self, 'units_since_last_query', []),
+            'moved_units': getattr(self, 'moved_units_since_last_query', []),
+            'completed_production': getattr(self, 'completed_production_since_last_query', []),
+            'tech_progress': getattr(self, 'tech_progress_since_last_query', {}),
+            'gold_change': getattr(self, 'gold_change_since_last_query', 0)
+        }
+
+        # Update last query time
+        self.last_state_query_time = current_time
+        return delta

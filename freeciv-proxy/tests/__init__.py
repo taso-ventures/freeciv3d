@@ -1,0 +1,1 @@
+# Test package for freeciv-proxy LLM support

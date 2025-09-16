@@ -57,19 +57,11 @@ jobs:
         distribution: 'temurin'
         cache: maven   
 
-    - name: Install dependencies
+    - name: Install Meson and Ninja
       run: |
-        sudo apt-get update
         if [ "${{ matrix.language }}" == "c-cpp" ]; then
+          sudo apt-get update
           sudo apt-get install -y meson ninja-build libjansson-dev libcurl4-openssl-dev
-        fi
-        if [ "${{ matrix.language }}" == "java-kotlin" ]; then
-          sudo apt-get install -y mysql-server
-          sudo systemctl start mysql
-          sudo mysql -e "CREATE DATABASE freeciv_web;"
-          sudo mysql -e "CREATE USER 'freeciv_web'@'localhost' IDENTIFIED BY 'password';"
-          sudo mysql -e "GRANT ALL PRIVILEGES ON freeciv_web.* TO 'freeciv_web'@'localhost';"
-          sudo mysql -e "FLUSH PRIVILEGES;"
         fi
 
     # Initializes the CodeQL tools for scanning.
@@ -85,22 +77,9 @@ jobs:
         # queries: security-extended,security-and-quality
 
 
-    # Custom build for different languages
-    - name: Build Java components
-      if: matrix.language == 'java-kotlin'
-      run: |
-        cd freeciv-web
-        mvn -Dflyway.configFiles=./flyway.properties clean compile -DskipTests
-
-    - name: Build C/C++ components
-      if: matrix.language == 'c-cpp'
-      run: |
-        cd freeciv
-        ./prepare_freeciv.sh
-
-    # For other languages, use autobuild
+    # Autobuild attempts to build any compiled languages (C/C++, C#, Go, Java, or Swift).
+    # If this step fails, then you should remove it and run the build manually (see below)
     - name: Autobuild
-      if: matrix.language == 'javascript-typescript' || matrix.language == 'python'
       uses: github/codeql-action/autobuild@v3
 
     # ℹ️ Command-line programs to run using the OS shell.

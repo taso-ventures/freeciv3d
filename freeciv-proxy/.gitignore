@@ -1,1 +1,30 @@
+# Environment variables (security-sensitive)
+.env
+
+# Configuration files
 settings.ini
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test coverage reports
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# Logs
+logs/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

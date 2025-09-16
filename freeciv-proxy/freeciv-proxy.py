@@ -28,6 +28,7 @@ from tornado import web, websocket, ioloop, httpserver
 from debugging import *
 import logging
 from civcom import *
+from llm_handler import LLMWSHandler
 import json
 import uuid
 import gc
@@ -152,6 +153,7 @@ if __name__ == "__main__":
 
         application = web.Application([
             (r'/civsocket/' + str(PROXY_PORT), WSHandler),
+            (r'/llmsocket/' + str(PROXY_PORT), LLMWSHandler),  # New endpoint for LLM agents
             (r"/", IndexHandler),
             (r"(.*)status", StatusHandler),
         ])

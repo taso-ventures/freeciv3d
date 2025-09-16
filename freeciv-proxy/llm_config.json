@@ -1,0 +1,55 @@
+{
+    "enabled": true,
+    "endpoint": "/llmsocket",
+    "max_agents": 2,
+    "cache_config": {
+        "ttl": 5,
+        "max_size_kb": 4,
+        "optimization_level": "high"
+    },
+    "validation": {
+        "strict": true,
+        "log_failures": true,
+        "rate_limit": {
+            "requests_per_second": 10,
+            "burst_capacity": 100
+        }
+    },
+    "capabilities": {
+        "default": [
+            "unit_move",
+            "unit_build_city",
+            "unit_explore",
+            "city_production",
+            "tech_research"
+        ],
+        "restricted": [
+            "city_buy",
+            "trade_route",
+            "declare_war"
+        ]
+    },
+    "authentication": {
+        "require_api_token": true,
+        "token_min_length": 10,
+        "token_env_var": "LLM_API_TOKENS",
+        "token_separator": ",",
+        "allow_env_override": true
+    },
+    "performance": {
+        "state_query_timeout_ms": 50,
+        "action_timeout_ms": 30,
+        "connection_timeout_s": 60
+    },
+    "spectator": {
+        "enabled": true,
+        "endpoint": "/spectator",
+        "allow_state_access": true
+    },
+    "logging": {
+        "level": "INFO",
+        "log_actions": true,
+        "log_state_queries": true,
+        "log_performance": true
+    }
+}
