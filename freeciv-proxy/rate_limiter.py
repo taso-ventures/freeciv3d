@@ -81,19 +81,23 @@ class RedisRateLimiter(RateLimiter):
         if not self.redis and redis_config:
             try:
                 import redis
-                self.redis = redis.Redis(
+                # Use connection pool for better performance and reliability
+                pool = redis.ConnectionPool(
                     host=redis_config.get('host', 'localhost'),
                     port=redis_config.get('port', 6379),
                     password=redis_config.get('password'),
                     db=redis_config.get('db', 0),
                     decode_responses=True,
-                    socket_timeout=1.0,
-                    socket_connect_timeout=1.0,
-                    retry_on_timeout=True
+                    socket_timeout=2.0,
+                    socket_connect_timeout=2.0,
+                    retry_on_timeout=True,
+                    max_connections=redis_config.get('max_connections', 20),
+                    health_check_interval=redis_config.get('health_check_interval', 30)
                 )
+                self.redis = redis.Redis(connection_pool=pool)
                 # Test connection
                 self.redis.ping()
-                logger.info("Connected to Redis for rate limiting")
+                logger.info("Connected to Redis with connection pool for rate limiting")
             except Exception as e:
                 logger.warning(f"Failed to connect to Redis: {e}")
                 self.redis = None

@@ -12,9 +12,15 @@ import hmac
 import hashlib
 import logging
 import os
+import secrets
+import threading
 from typing import Dict, Any, Optional, Set
 from dataclasses import dataclass, field
 from enum import Enum
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None
 
 logger = logging.getLogger("freeciv-proxy")
 
@@ -58,9 +64,10 @@ class SessionManager:
         self.agent_to_session: Dict[str, str] = {}  # agent_id -> session_id mapping
 
         # Session security
-        self.session_secret = os.getenv('SESSION_SECRET', 'default-session-secret-change-in-production')
-        if self.session_secret == 'default-session-secret-change-in-production':
-            logger.warning("Using default session secret - set SESSION_SECRET environment variable")
+        self.session_secret = self._get_secure_session_secret()
+
+        # Thread safety for session management
+        self._session_lock = threading.RLock()
 
         # Cleanup tracking
         self.last_cleanup = time.time()
@@ -75,7 +82,7 @@ class SessionManager:
         }
 
     def create_session(self, agent_id: str, api_token: str,
-                      capabilities: Set[str] = None) -> Optional[SessionInfo]:
+                      capabilities: Optional[Set[str]] = None) -> Optional[SessionInfo]:
         """
         Create a new session for an agent
 
@@ -87,47 +94,48 @@ class SessionManager:
         Returns:
             SessionInfo if successful, None if failed
         """
-        try:
-            # Check session limits
-            if len(self.sessions) >= self.max_concurrent_sessions:
-                logger.warning(f"Maximum concurrent sessions reached: {self.max_concurrent_sessions}")
+        with self._session_lock:
+            try:
+                # Check session limits with thread safety
+                if len(self.sessions) >= self.max_concurrent_sessions:
+                    logger.warning(f"Maximum concurrent sessions reached: {self.max_concurrent_sessions}")
+                    return None
+
+                # Terminate existing session for this agent if any
+                self.terminate_agent_session(agent_id)
+
+                # Generate secure session ID
+                session_id = self._generate_session_id(agent_id)
+
+                # Hash the API token for storage
+                api_token_hash = self._hash_token(api_token)
+
+                now = time.time()
+                session = SessionInfo(
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    api_token_hash=api_token_hash,
+                    created_at=now,
+                    last_activity=now,
+                    expires_at=now + self.session_timeout,
+                    capabilities=capabilities or set(),
+                    state=SessionState.ACTIVE
+                )
+
+                # Store session
+                self.sessions[session_id] = session
+                self.agent_to_session[agent_id] = session_id
+
+                self.stats['sessions_created'] += 1
+                logger.info(f"Created session for agent {agent_id}: {session_id}")
+
+                return session
+
+            except Exception as e:
+                logger.error(f"Failed to create session for agent {agent_id}: {e}")
                 return None
 
-            # Terminate existing session for this agent if any
-            self.terminate_agent_session(agent_id)
-
-            # Generate secure session ID
-            session_id = self._generate_session_id(agent_id)
-
-            # Hash the API token for storage
-            api_token_hash = self._hash_token(api_token)
-
-            now = time.time()
-            session = SessionInfo(
-                session_id=session_id,
-                agent_id=agent_id,
-                api_token_hash=api_token_hash,
-                created_at=now,
-                last_activity=now,
-                expires_at=now + self.session_timeout,
-                capabilities=capabilities or set(),
-                state=SessionState.ACTIVE
-            )
-
-            # Store session
-            self.sessions[session_id] = session
-            self.agent_to_session[agent_id] = session_id
-
-            self.stats['sessions_created'] += 1
-            logger.info(f"Created session for agent {agent_id}: {session_id}")
-
-            return session
-
-        except Exception as e:
-            logger.error(f"Failed to create session for agent {agent_id}: {e}")
-            return None
-
-    def validate_session(self, session_id: str, api_token: str = None) -> Optional[SessionInfo]:
+    def validate_session(self, session_id: str, api_token: Optional[str] = None) -> Optional[SessionInfo]:
         """
         Validate an existing session
 
@@ -163,8 +171,7 @@ class SessionManager:
 
             # Verify API token if provided
             if api_token:
-                api_token_hash = self._hash_token(api_token)
-                if not hmac.compare_digest(session.api_token_hash, api_token_hash):
+                if not self._verify_token(api_token, session.api_token_hash):
                     logger.warning(f"Invalid API token for session {session_id}")
                     self.stats['authentication_failures'] += 1
                     return None
@@ -229,6 +236,9 @@ class SessionManager:
         # Remove from agent mapping
         if session.agent_id in self.agent_to_session:
             del self.agent_to_session[session.agent_id]
+
+        # Remove from sessions dictionary to free up space
+        del self.sessions[session_id]
 
         self.stats['sessions_terminated'] += 1
         logger.info(f"Terminated session {session_id} for agent {session.agent_id}: {reason}")
@@ -345,12 +355,68 @@ class SessionManager:
         return f"sess_{session_id[:32]}"
 
     def _hash_token(self, token: str) -> str:
-        """Hash API token for secure storage"""
-        return hmac.new(
-            self.session_secret.encode('utf-8'),
-            token.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
+        """Hash API token for secure storage using bcrypt or fallback to PBKDF2"""
+        if bcrypt:
+            # Use bcrypt for secure password hashing
+            salt = bcrypt.gensalt(rounds=12)
+            return bcrypt.hashpw(token.encode('utf-8'), salt).decode('utf-8')
+        else:
+            # Fallback to PBKDF2 with salt (more secure than plain HMAC-SHA256)
+            salt = secrets.token_bytes(32)
+            key = hashlib.pbkdf2_hmac('sha256', token.encode('utf-8'), salt, 100000)
+            # Store salt + hash together
+            return salt.hex() + ':' + key.hex()
+
+    def _verify_token(self, token: str, stored_hash: str) -> bool:
+        """Verify token against stored hash using constant-time comparison"""
+        try:
+            if bcrypt:
+                # bcrypt handles salt and timing attacks internally
+                return bcrypt.checkpw(token.encode('utf-8'), stored_hash.encode('utf-8'))
+            else:
+                # PBKDF2 verification
+                if ':' not in stored_hash:
+                    # Legacy format - fall back to HMAC comparison
+                    legacy_hash = hmac.new(
+                        self.session_secret.encode('utf-8'),
+                        token.encode('utf-8'),
+                        hashlib.sha256
+                    ).hexdigest()
+                    return hmac.compare_digest(stored_hash, legacy_hash)
+
+                salt_hex, key_hex = stored_hash.split(':', 1)
+                salt = bytes.fromhex(salt_hex)
+                stored_key = bytes.fromhex(key_hex)
+                new_key = hashlib.pbkdf2_hmac('sha256', token.encode('utf-8'), salt, 100000)
+                return hmac.compare_digest(stored_key, new_key)
+        except Exception as e:
+            logger.error(f"Token verification error: {e}")
+            return False
+
+    def _get_secure_session_secret(self) -> str:
+        """Get or generate secure session secret"""
+        secret = os.getenv('SESSION_SECRET')
+
+        if not secret:
+            # Check if we're in production environment
+            env = os.getenv('ENVIRONMENT', 'development').lower()
+            if env == 'production':
+                raise ValueError(
+                    "SESSION_SECRET environment variable is required in production. "
+                    "Generate with: python -c 'import secrets; print(secrets.token_urlsafe(64))'"
+                )
+
+            # Generate random secret for development
+            secret = secrets.token_urlsafe(64)
+            logger.warning(
+                "No SESSION_SECRET set. Generated random secret for development. "
+                "Set SESSION_SECRET environment variable for production."
+            )
+
+        if len(secret) < 32:
+            raise ValueError("SESSION_SECRET must be at least 32 characters long")
+
+        return secret
 
 # Global session manager instance
 session_manager = SessionManager()

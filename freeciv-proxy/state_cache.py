@@ -12,6 +12,7 @@ import logging
 import hmac
 import hashlib
 import os
+import gzip
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -26,6 +27,8 @@ class CacheEntry:
     player_id: int
     cache_key: str = ""  # Original cache key
     signature: str = ""  # HMAC signature for integrity
+    is_compressed: bool = False  # Whether data is compressed
+    compressed_data: Optional[bytes] = None  # Compressed data if applicable
 
 class StateCache:
     """
@@ -33,12 +36,17 @@ class StateCache:
     Optimizes game state queries to meet < 4KB and < 50ms requirements
     """
 
-    def __init__(self, ttl: int = 5, max_size_kb: int = 4):
+    def __init__(self, ttl: int = 5, max_size_kb: int = 4, enable_compression: bool = True):
         self.ttl = ttl  # Time-to-live in seconds
         self.max_size_bytes = max_size_kb * 1024
+        self.enable_compression = enable_compression
         self.cache: Dict[str, CacheEntry] = {}
         self.hit_count = 0
         self.miss_count = 0
+
+        # Performance metrics
+        self.compression_ratio_sum = 0.0
+        self.compression_count = 0
 
         # HMAC secret for cache integrity
         self.hmac_secret = os.getenv('CACHE_HMAC_SECRET', 'default-secret-change-in-production')
@@ -75,10 +83,33 @@ class StateCache:
         # Optimize data size first
         optimized = self.optimize_state_data(data)
         data_str = json.dumps(optimized, separators=(',', ':'))
-        size = len(data_str.encode('utf-8'))
+        serialized_bytes = data_str.encode('utf-8')
+        original_size = len(serialized_bytes)
 
-        if size > self.max_size_bytes:
-            logger.warning(f"State too large for cache: {size} bytes (max: {self.max_size_bytes})")
+        # Try compression if enabled and data is large enough
+        compressed_data = None
+        final_size = original_size
+
+        if self.enable_compression and original_size > 1024:  # Only compress if > 1KB
+            try:
+                compressed_data = gzip.compress(serialized_bytes, compresslevel=6)
+                compressed_size = len(compressed_data)
+
+                # Use compression if it provides significant savings (>20%)
+                if compressed_size < original_size * 0.8:
+                    final_size = compressed_size
+                    compression_ratio = original_size / compressed_size
+                    self.compression_ratio_sum += compression_ratio
+                    self.compression_count += 1
+                    logger.debug(f"Compressed state: {original_size} -> {compressed_size} bytes (ratio: {compression_ratio:.2f})")
+                else:
+                    compressed_data = None  # Don't use compression
+            except Exception as e:
+                logger.warning(f"Compression failed: {e}")
+                compressed_data = None
+
+        if final_size > self.max_size_bytes:
+            logger.warning(f"State too large for cache: {final_size} bytes (max: {self.max_size_bytes})")
             return False
 
         # Generate HMAC signature for integrity

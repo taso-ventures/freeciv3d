@@ -329,6 +329,90 @@ class TestSessionManagement(unittest.TestCase):
         validated_session = self.session_manager.validate_session(session.session_id, wrong_token)
         self.assertIsNone(validated_session)
 
+    def test_concurrent_session_limits(self):
+        """Test concurrent session limits and thread safety"""
+        import threading
+        import concurrent.futures
+
+        # Create session manager with low limit for testing
+        limited_session_manager = SessionManager(max_concurrent_sessions=3)
+
+        # Function to create sessions concurrently
+        def create_session_worker(agent_id: str, api_token: str):
+            return limited_session_manager.create_session(agent_id, api_token)
+
+        # Create multiple sessions up to the limit
+        sessions = []
+        for i in range(3):
+            session = limited_session_manager.create_session(f"agent-{i}", f"token-{i}")
+            self.assertIsNotNone(session)
+            sessions.append(session)
+
+        # Should reject additional session
+        overflow_session = limited_session_manager.create_session("agent-overflow", "token-overflow")
+        self.assertIsNone(overflow_session)
+
+        # Test concurrent session creation with threading
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Try to create 5 sessions concurrently when limit is 3
+            futures = []
+            for i in range(5, 10):
+                future = executor.submit(create_session_worker, f"concurrent-agent-{i}", f"token-{i}")
+                futures.append(future)
+
+            # Collect results
+            results = [future.result() for future in futures]
+
+            # Should have no successful sessions (all slots taken)
+            successful_sessions = [r for r in results if r is not None]
+            self.assertEqual(len(successful_sessions), 0)
+
+        # Clean up by terminating a session
+        terminated = limited_session_manager.terminate_session(sessions[0].session_id)
+        self.assertTrue(terminated)
+
+        # Now should be able to create one more
+        new_session = limited_session_manager.create_session("agent-new", "token-new")
+        self.assertIsNotNone(new_session)
+
+    def test_session_race_condition_prevention(self):
+        """Test prevention of race conditions in session creation"""
+        import threading
+        import concurrent.futures
+
+        # Create session manager with limit of 1 for clear testing
+        race_session_manager = SessionManager(max_concurrent_sessions=1)
+
+        results = []
+        errors = []
+
+        def concurrent_session_creator(agent_id: str):
+            try:
+                return race_session_manager.create_session(agent_id, f"token-{agent_id}")
+            except Exception as e:
+                errors.append(e)
+                return None
+
+        # Launch multiple threads trying to create sessions simultaneously
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = []
+            for i in range(10):
+                future = executor.submit(concurrent_session_creator, f"race-agent-{i}")
+                futures.append(future)
+
+            # Collect results
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                results.append(result)
+
+        # Should have exactly one successful session and 9 None results
+        successful_sessions = [r for r in results if r is not None]
+        failed_sessions = [r for r in results if r is None]
+
+        self.assertEqual(len(successful_sessions), 1)
+        self.assertEqual(len(failed_sessions), 9)
+        self.assertEqual(len(errors), 0)  # No exceptions should occur
+
     def test_session_cleanup(self):
         """Test expired session cleanup"""
         agent_id = "test-agent"

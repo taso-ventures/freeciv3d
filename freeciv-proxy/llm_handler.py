@@ -832,8 +832,33 @@ class LLMWSHandler(websocket.WebSocketHandler):
         return False
 
     def check_origin(self, origin):
-        """Allow connections from any origin for LLM agents"""
-        return True
+        """Validate WebSocket origin for security"""
+        # Get allowed origins from config
+        allowed_origins = llm_config.get('allowed_origins', [
+            'http://localhost:8080',
+            'https://localhost:8080',
+            'http://127.0.0.1:8080',
+            'https://127.0.0.1:8080'
+        ])
+
+        # Allow null origin for non-browser clients (LLM agents)
+        if origin is None:
+            logger.debug("Allowing null origin for LLM agent")
+            return True
+
+        # Check against allowed origins list
+        if origin in allowed_origins:
+            logger.debug(f"Allowing origin: {origin}")
+            return True
+
+        # Log unauthorized origin attempts
+        SecurityLogger.log_security_violation(
+            self.agent_id or "unknown",
+            "INVALID_ORIGIN",
+            f"Rejected origin: {origin}"
+        )
+        logger.warning(f"Rejected WebSocket connection from unauthorized origin: {origin}")
+        return False
 
     def get_compression_options(self):
         """Enable WebSocket compression"""

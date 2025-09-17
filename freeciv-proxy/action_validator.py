@@ -14,7 +14,7 @@ logger = logging.getLogger("freeciv-proxy")
 
 class ValidationResult:
     """Result of action validation"""
-    def __init__(self, is_valid: bool, error_code: str = None, error_message: str = None):
+    def __init__(self, is_valid: bool, error_code: Optional[str] = None, error_message: Optional[str] = None):
         self.is_valid = is_valid
         self.error_code = error_code
         self.error_message = error_message
@@ -50,7 +50,7 @@ class LLMActionValidator:
         ActionType.TRADE_ROUTE
     ]
 
-    def __init__(self, capabilities: List[ActionType] = None):
+    def __init__(self, capabilities: Optional[List[ActionType]] = None):
         self.capabilities = capabilities or self.DEFAULT_CAPABILITIES.copy()
         self.validation_stats = {
             'total_actions': 0,
@@ -59,7 +59,7 @@ class LLMActionValidator:
             'errors_by_type': {}
         }
 
-    def validate_action(self, action: Dict[str, Any], player_id: int, game_state: Dict[str, Any] = None) -> ValidationResult:
+    def validate_action(self, action: Dict[str, Any], player_id: int, game_state: Optional[Dict[str, Any]] = None) -> ValidationResult:
         """
         Validate an LLM action before forwarding to server
 
@@ -122,7 +122,7 @@ class LLMActionValidator:
 
         return result
 
-    def _validate_unit_move(self, action: Dict[str, Any], player_id: int, game_state: Dict[str, Any]) -> ValidationResult:
+    def _validate_unit_move(self, action: Dict[str, Any], player_id: int, game_state: Optional[Dict[str, Any]]) -> ValidationResult:
         """Validate unit movement action"""
         required_fields = ['unit_id', 'dest_x', 'dest_y']
         for field in required_fields:
@@ -140,9 +140,9 @@ class LLMActionValidator:
         except (ValueError, TypeError):
             return self._validation_error('E011', 'Destination coordinates must be integers')
 
-        # Validate coordinates are reasonable (basic bounds check)
-        if dest_x < 0 or dest_y < 0 or dest_x > 200 or dest_y > 200:
-            return self._validation_error('E012', 'Destination coordinates out of reasonable bounds')
+        # Enhanced coordinate validation against actual game boundaries
+        if not self._validate_coordinates(dest_x, dest_y, game_state):
+            return self._validation_error('E012', 'Destination coordinates out of game bounds')
 
         # If game state is available, validate unit ownership
         if game_state and 'units' in game_state:
@@ -159,7 +159,7 @@ class LLMActionValidator:
 
         return ValidationResult(True)
 
-    def _validate_unit_build_city(self, action: Dict[str, Any], player_id: int, game_state: Dict[str, Any]) -> ValidationResult:
+    def _validate_unit_build_city(self, action: Dict[str, Any], player_id: int, game_state: Optional[Dict[str, Any]]) -> ValidationResult:
         """Validate city building action"""
         if 'unit_id' not in action:
             return self._validation_error('E020', 'Build city requires unit_id')
@@ -183,7 +183,7 @@ class LLMActionValidator:
 
         return ValidationResult(True)
 
-    def _validate_city_production(self, action: Dict[str, Any], player_id: int, game_state: Dict[str, Any]) -> ValidationResult:
+    def _validate_city_production(self, action: Dict[str, Any], player_id: int, game_state: Optional[Dict[str, Any]]) -> ValidationResult:
         """Validate city production change"""
         required_fields = ['city_id', 'production_type']
         for field in required_fields:
@@ -215,7 +215,7 @@ class LLMActionValidator:
 
         return ValidationResult(True)
 
-    def _validate_tech_research(self, action: Dict[str, Any], player_id: int, game_state: Dict[str, Any]) -> ValidationResult:
+    def _validate_tech_research(self, action: Dict[str, Any], player_id: int, game_state: Optional[Dict[str, Any]]) -> ValidationResult:
         """Validate technology research action"""
         if 'tech_name' not in action:
             return self._validation_error('E040', 'Tech research requires tech_name')
@@ -234,7 +234,7 @@ class LLMActionValidator:
 
         return ValidationResult(True)
 
-    def _validate_basic_action(self, action: Dict[str, Any], player_id: int, game_state: Dict[str, Any]) -> ValidationResult:
+    def _validate_basic_action(self, action: Dict[str, Any], player_id: int, game_state: Optional[Dict[str, Any]]) -> ValidationResult:
         """Basic validation for other action types"""
         # Ensure action has reasonable structure
         if len(action) > 20:  # Prevent overly complex actions
@@ -260,3 +260,20 @@ class LLMActionValidator:
         """Remove capability for this validator"""
         if action_type in self.capabilities:
             self.capabilities.remove(action_type)
+
+    def _validate_coordinates(self, x: int, y: int, game_state: Optional[Dict[str, Any]] = None) -> bool:
+        """Enhanced coordinate validation against actual game boundaries"""
+        if game_state and 'map_info' in game_state:
+            map_info = game_state['map_info']
+            max_x = map_info.get('width', 100)  # Default to reasonable bounds
+            max_y = map_info.get('height', 100)
+
+            if not (0 <= x < max_x and 0 <= y < max_y):
+                return False
+        else:
+            # Fallback to more reasonable coordinate bounds when no game state
+            # Accept coordinates from 0 to 200 (reasonable for most game maps)
+            if not (0 <= x <= 200 and 0 <= y <= 200):
+                return False
+
+        return True
