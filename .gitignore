@@ -81,3 +81,12 @@ tests/screenshot*.png
 .freeciv_index
 .idea
 *.iml
+
+# Claude Code generated files
+agents.md
+CLAUDE.md
+Technical Spec.md
+.cursor/*
+
+# macOS system files
+.DS_Store
