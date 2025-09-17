@@ -29,6 +29,7 @@ from debugging import *
 import logging
 from civcom import *
 from llm_handler import LLMWSHandler
+from state_extractor import StateExtractorHandler, LegalActionsHandler
 import json
 import uuid
 import gc
@@ -154,6 +155,8 @@ if __name__ == "__main__":
         application = web.Application([
             (r'/civsocket/' + str(PROXY_PORT), WSHandler),
             (r'/llmsocket/' + str(PROXY_PORT), LLMWSHandler),  # New endpoint for LLM agents
+            (r"/api/game/([^/]+)/state", StateExtractorHandler),  # REST API for state extraction
+            (r"/api/game/([^/]+)/legal_actions", LegalActionsHandler),  # REST API for legal actions
             (r"/", IndexHandler),
             (r"(.*)status", StatusHandler),
         ])

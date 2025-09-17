@@ -295,6 +295,36 @@ class ErrorHandler:
             'error_types': list(self.error_counts.keys())
         }
 
+    def handle_state_extraction_error(self, game_id: str, player_id: int, error: str) -> ErrorResponse:
+        """Handle state extraction errors"""
+        logger.error(f"State extraction failed for game {game_id}, player {player_id}: {error}")
+        return ErrorResponse(
+            code=ErrorCode.SYSTEM_INTERNAL,
+            message=f"Failed to extract game state: {error}",
+            category=ErrorCategory.SYSTEM,
+            severity=ErrorSeverity.HIGH,
+            details={
+                'game_id': game_id,
+                'player_id': player_id,
+                'operation': 'state_extraction'
+            }
+        )
+
+    def handle_action_extraction_error(self, game_id: str, player_id: int, error: str) -> ErrorResponse:
+        """Handle legal action extraction errors"""
+        logger.error(f"Action extraction failed for game {game_id}, player {player_id}: {error}")
+        return ErrorResponse(
+            code=ErrorCode.SYSTEM_INTERNAL,
+            message=f"Failed to extract legal actions: {error}",
+            category=ErrorCategory.SYSTEM,
+            severity=ErrorSeverity.HIGH,
+            details={
+                'game_id': game_id,
+                'player_id': player_id,
+                'operation': 'action_extraction'
+            }
+        )
+
 # Global error handler instance
 error_handler = ErrorHandler()
 

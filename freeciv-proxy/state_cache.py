@@ -48,10 +48,12 @@ class StateCache:
         self.compression_ratio_sum = 0.0
         self.compression_count = 0
 
-        # HMAC secret for cache integrity
-        self.hmac_secret = os.getenv('CACHE_HMAC_SECRET', 'default-secret-change-in-production')
-        if self.hmac_secret == 'default-secret-change-in-production':
-            logger.warning("Using default HMAC secret - set CACHE_HMAC_SECRET environment variable")
+        # HMAC secret for cache integrity - required for security
+        self.hmac_secret = os.getenv('CACHE_HMAC_SECRET')
+        if not self.hmac_secret:
+            raise ValueError("CACHE_HMAC_SECRET environment variable must be set for cache integrity")
+        if len(self.hmac_secret) < 32:
+            raise ValueError("CACHE_HMAC_SECRET must be at least 32 characters long for security")
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         """Get cached state with TTL and integrity check"""
@@ -62,7 +64,18 @@ class StateCache:
                 if self._verify_cache_integrity(entry):
                     self.hit_count += 1
                     logger.debug(f"Cache hit for key: {key}")
-                    return entry.data
+
+                    # Handle decompression if needed
+                    if entry.is_compressed and entry.compressed_data:
+                        try:
+                            decompressed_bytes = gzip.decompress(entry.compressed_data)
+                            return json.loads(decompressed_bytes.decode('utf-8'))
+                        except Exception as e:
+                            logger.error(f"Decompression failed for key {key}: {e}")
+                            del self.cache[key]
+                            return None
+                    else:
+                        return entry.data
                 else:
                     # Cache poisoning detected, remove entry
                     del self.cache[key]
@@ -117,15 +130,17 @@ class StateCache:
 
         # Store in cache with signature
         self.cache[key] = CacheEntry(
-            data=optimized,
+            data=optimized if compressed_data is None else None,  # Store original data only if not compressed
             timestamp=time.time(),
-            size_bytes=size,
+            size_bytes=final_size,
             player_id=player_id,
             cache_key=key,
-            signature=signature
+            signature=signature,
+            is_compressed=compressed_data is not None,
+            compressed_data=compressed_data
         )
 
-        logger.debug(f"Cached state for key: {key}, size: {size} bytes")
+        logger.debug(f"Cached state for key: {key}, size: {final_size} bytes")
         return True
 
     def invalidate(self, pattern: str = None, player_id: int = None):
