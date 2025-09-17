@@ -29,7 +29,9 @@ from debugging import *
 import logging
 from civcom import *
 from llm_handler import LLMWSHandler
-from state_extractor import StateExtractorHandler, LegalActionsHandler
+from state_extractor import StateExtractorHandler, LegalActionsHandler, shutdown_executor, civcom_registry
+from monitoring import HealthCheckHandler, MetricsHandler, StatsHandler
+from admin_handlers import AdminAuthHandler
 import json
 import uuid
 import gc
@@ -157,6 +159,10 @@ if __name__ == "__main__":
             (r'/llmsocket/' + str(PROXY_PORT), LLMWSHandler),  # New endpoint for LLM agents
             (r"/api/game/([^/]+)/state", StateExtractorHandler),  # REST API for state extraction
             (r"/api/game/([^/]+)/legal_actions", LegalActionsHandler),  # REST API for legal actions
+            (r"/health", HealthCheckHandler),  # Health check endpoint
+            (r"/metrics", MetricsHandler),  # Prometheus metrics endpoint
+            (r"/stats", StatsHandler),  # JSON stats endpoint
+            (r"/admin/auth", AdminAuthHandler),  # Admin authentication management
             (r"/", IndexHandler),
             (r"(.*)status", StatusHandler),
         ])
@@ -167,3 +173,5 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print('Exiting...')
+        # Gracefully shutdown thread pool
+        shutdown_executor()

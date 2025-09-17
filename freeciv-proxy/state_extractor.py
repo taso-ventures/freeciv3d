@@ -9,29 +9,238 @@ Provides REST API endpoints for game state extraction and optimization
 import json
 import time
 import logging
+import os
 from enum import Enum
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Tuple
 from tornado import web
 from tornado.concurrent import run_on_executor
 from concurrent.futures import ThreadPoolExecutor
 
 from state_cache import StateCache, CacheEntry
 from civcom import CivCom
+
+# Required modules for production use
 try:
     from error_handler import error_handler, ErrorSeverity, ErrorCategory
-except ImportError:
-    # Fallback for testing
-    class MockErrorHandler:
-        def handle_state_extraction_error(self, game_id, player_id, error):
-            return {"error": error}
-        def handle_action_extraction_error(self, game_id, player_id, error):
-            return {"error": error}
-    error_handler = MockErrorHandler()
+    from security import InputSanitizer
+    from api_rate_limiter import api_rate_limiter
+    from auth import authenticator, AuthenticationError, AuthorizationError
+except ImportError as e:
+    raise ImportError(
+        f"Failed to import required modules: {e}. "
+        "The error_handler, security, api_rate_limiter, and auth modules are required. "
+        "Ensure all required .py files are available in the Python path."
+    )
 
 logger = logging.getLogger("freeciv-proxy")
 
+
+class StateExtractionError(Exception):
+    """Exception raised during state extraction operations"""
+    def __init__(self, message: str, game_id: str = None, player_id: int = None, cause: Exception = None):
+        super().__init__(message)
+        self.game_id = game_id
+        self.player_id = player_id
+        self.cause = cause
+
+
+class CacheError(Exception):
+    """Exception raised during cache operations"""
+    def __init__(self, message: str, cache_key: str = None, operation: str = None):
+        super().__init__(message)
+        self.cache_key = cache_key
+        self.operation = operation
+
+
+class ValidationError(Exception):
+    """Exception raised during input validation"""
+    def __init__(self, message: str, parameter: str = None, value: Any = None):
+        super().__init__(message)
+        self.parameter = parameter
+        self.value = value
+
+
+class CivComNotFoundError(StateExtractionError):
+    """Exception raised when CivCom instance is not available"""
+    def __init__(self, game_id: str):
+        message = f"No CivCom instance available for game {game_id}"
+        super().__init__(message, game_id=game_id)
+
+
+class CivComRegistry:
+    """
+    Registry for CivCom instances with proper lifecycle management
+    Provides clean interface for registering and retrieving game connections
+    """
+
+    def __init__(self):
+        self._civcom_instances: Dict[str, CivCom] = {}
+        self._game_metadata: Dict[str, Dict[str, Any]] = {}
+
+    def register_game(self, game_id: str, civcom: CivCom, metadata: Optional[Dict[str, Any]] = None):
+        """Register a CivCom instance for a game"""
+        if not isinstance(game_id, str) or not game_id.strip():
+            raise ValueError("game_id must be a non-empty string")
+
+        if not civcom:
+            raise ValueError("civcom instance cannot be None")
+
+        self._civcom_instances[game_id] = civcom
+        self._game_metadata[game_id] = metadata or {}
+
+        logger.info(f"Registered CivCom for game: {game_id}")
+
+    def unregister_game(self, game_id: str):
+        """Unregister a game and clean up resources"""
+        if game_id in self._civcom_instances:
+            try:
+                # Try to cleanup the civcom instance if it has cleanup methods
+                civcom = self._civcom_instances[game_id]
+                if hasattr(civcom, 'cleanup'):
+                    civcom.cleanup()
+                elif hasattr(civcom, 'close'):
+                    civcom.close()
+            except Exception as e:
+                logger.warning(f"Error cleaning up CivCom for game {game_id}: {e}")
+
+            del self._civcom_instances[game_id]
+            if game_id in self._game_metadata:
+                del self._game_metadata[game_id]
+
+            logger.info(f"Unregistered CivCom for game: {game_id}")
+
+    def get_civcom(self, game_id: str) -> Optional[CivCom]:
+        """Get CivCom instance for a game"""
+        if not isinstance(game_id, str):
+            return None
+
+        return self._civcom_instances.get(game_id)
+
+    def has_game(self, game_id: str) -> bool:
+        """Check if game is registered"""
+        return game_id in self._civcom_instances
+
+    def list_games(self) -> List[str]:
+        """Get list of registered game IDs"""
+        return list(self._civcom_instances.keys())
+
+    def get_game_metadata(self, game_id: str) -> Dict[str, Any]:
+        """Get metadata for a game"""
+        return self._game_metadata.get(game_id, {})
+
+    def get_registry_stats(self) -> Dict[str, Any]:
+        """Get registry statistics"""
+        return {
+            'total_games': len(self._civcom_instances),
+            'active_games': list(self._civcom_instances.keys()),
+            'registry_size_kb': len(str(self._civcom_instances)) / 1024
+        }
+
+# Global registry for CivCom instances
+civcom_registry = CivComRegistry()
+
 # Shared thread pool executor for all state extraction operations
-_shared_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="state-extractor")
+# Configurable via environment variable, defaults to 4
+_MAX_WORKERS = int(os.getenv('STATE_EXTRACTOR_THREADS', '4'))
+_shared_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="state-extractor")
+
+def shutdown_executor():
+    """Shutdown the shared thread pool executor gracefully"""
+    if _shared_executor:
+        logger.info("Shutting down state extractor thread pool...")
+        _shared_executor.shutdown(wait=True)
+        logger.info("State extractor thread pool shutdown complete")
+
+
+def authenticate_request(request_handler, required_permission: str = 'state_read') -> Tuple[bool, Optional[int], Optional[str], str]:
+    """
+    Authenticate request using API key or session
+
+    Returns:
+        tuple: (authenticated: bool, player_id: Optional[int], game_id: Optional[str], error_message: str)
+    """
+    # Check if authentication is enabled
+    auth_enabled = os.getenv('AUTH_ENABLED', 'false').lower() == 'true'
+    if not auth_enabled:
+        # Authentication disabled, allow request but log warning
+        logger.debug("Authentication disabled, allowing request")
+        return True, None, None, ""
+
+    try:
+        # Get authentication credentials from headers or query params
+        api_key = request_handler.get_argument('api_key', None)
+        if not api_key:
+            api_key = request_handler.request.headers.get('Authorization')
+            if api_key and api_key.startswith('Bearer '):
+                api_key = api_key[7:]
+
+        session_id = request_handler.get_argument('session_id', None)
+        if not session_id:
+            session_id = request_handler.request.headers.get('X-Session-ID')
+
+        # Attempt authentication
+        authenticated, auth_player_id, auth_game_id = authenticator.authenticate_request(
+            api_key=api_key,
+            session_id=session_id,
+            required_permission=required_permission
+        )
+
+        if not authenticated:
+            return False, None, None, "Authentication required. Provide valid API key or session ID."
+
+        return True, auth_player_id, auth_game_id, ""
+
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        return False, None, None, f"Authentication failed: {e}"
+
+
+def validate_request_parameters(game_id: str, player_id: Any, format_str: str = 'full', since_turn: Any = None) -> tuple:
+    """
+    Validate and sanitize request parameters
+
+    Returns:
+        tuple: (validated_game_id, validated_player_id, validated_format, validated_since_turn)
+
+    Raises:
+        ValidationError: If any parameter is invalid
+    """
+    try:
+        # Validate game_id (alphanumeric, underscores, max 50 chars)
+        if not isinstance(game_id, str) or not game_id.strip():
+            raise ValidationError("Game ID must be a non-empty string", parameter="game_id", value=game_id)
+
+        if len(game_id) > 50 or not all(c.isalnum() or c in '_-' for c in game_id):
+            raise ValidationError("Game ID must be alphanumeric with underscores/hyphens, max 50 characters",
+                                parameter="game_id", value=game_id)
+
+        # Validate player_id
+        validated_player_id = InputSanitizer.sanitize_player_id(player_id)
+
+        # Validate format
+        valid_formats = ['full', 'delta', 'llm_optimized']
+        if format_str not in valid_formats:
+            raise ValidationError(f"Format must be one of: {', '.join(valid_formats)}",
+                                parameter="format", value=format_str)
+
+        # Validate since_turn if provided
+        validated_since_turn = None
+        if since_turn is not None:
+            try:
+                validated_since_turn = int(since_turn)
+                if validated_since_turn < 0 or validated_since_turn > 10000:  # Reasonable bounds
+                    raise ValidationError("Since turn must be between 0 and 10000",
+                                        parameter="since_turn", value=since_turn)
+            except (ValueError, TypeError):
+                raise ValidationError("Since turn must be a valid integer",
+                                    parameter="since_turn", value=since_turn)
+
+        return game_id.strip(), validated_player_id, format_str, validated_since_turn
+
+    except ValidationError:
+        raise
+    except Exception as e:
+        raise ValidationError(f"Parameter validation failed: {e}")
 
 
 class StateFormat(Enum):
@@ -47,29 +256,25 @@ class StateExtractor:
     Handles game state retrieval, optimization, and caching
     """
 
-    def __init__(self, civcom: Optional[CivCom] = None, cache: Optional[StateCache] = None):
-        self.civcom = civcom  # Will be set when needed
+    def __init__(self, civcom: Optional[CivCom] = None, cache: Optional[StateCache] = None,
+                 registry: Optional[CivComRegistry] = None):
+        self.civcom = civcom  # Optional fallback civcom instance
         self.cache = cache or StateCache(ttl=5, max_size_kb=4)
         self.executor = _shared_executor
+        self.registry = registry or civcom_registry  # Use global registry by default
 
     def _get_civcom_for_game(self, game_id: str) -> Optional[CivCom]:
-        """Get CivCom instance for a game from global registry"""
-        # Try to get from provided civcom first
+        """Get CivCom instance for a game from registry or fallback"""
+        # Try registry first
+        civcom = self.registry.get_civcom(game_id)
+        if civcom:
+            return civcom
+
+        # Fallback to provided civcom if it exists and has required methods
         if self.civcom and hasattr(self.civcom, 'get_full_state'):
+            logger.debug(f"Using fallback civcom for game {game_id}")
             return self.civcom
 
-        # For production use, this would be injected via dependency injection
-        # For now, return None and let the calling code handle the error
-        return None
-
-    def set_civcom_registry(self, get_civcom_func):
-        """Inject function to get civcom instances (dependency injection)"""
-        self._get_civcom_func = get_civcom_func
-
-    def _get_civcom_registry(self, game_id: str) -> Optional[CivCom]:
-        """Get civcom from injected registry function"""
-        if hasattr(self, '_get_civcom_func'):
-            return self._get_civcom_func(game_id)
         return None
 
     def extract_state(self, game_id: str, player_id: int, format_type: StateFormat,
@@ -97,10 +302,7 @@ class StateExtractor:
         # Get civcom for this game
         civcom = self._get_civcom_for_game(game_id)
         if not civcom:
-            # Try registry function if available
-            civcom = self._get_civcom_registry(game_id)
-        if not civcom:
-            raise Exception(f"No civcom available for game {game_id}")
+            raise CivComNotFoundError(game_id)
 
         # Extract fresh state
         start_time = time.time()
@@ -116,7 +318,7 @@ class StateExtractor:
                 elif format_type == StateFormat.LLM_OPTIMIZED:
                     state = self._format_llm_optimized_state(raw_state, player_id)
                 else:
-                    raise ValueError(f"Unsupported format: {format_type}")
+                    raise ValidationError(f"Unsupported format: {format_type}", parameter="format", value=format_type.value)
 
             # Cache the result
             self.cache.set(cache_key, state, player_id)
@@ -126,12 +328,23 @@ class StateExtractor:
 
             return state
 
-        except Exception as e:
+        except (CivComNotFoundError, ValidationError, StateExtractionError) as e:
+            # Re-raise specific exceptions with preserved context
+            logger.error(f"State extraction failed for game {game_id}, player {player_id}: {e}")
             error_response = error_handler.handle_state_extraction_error(
                 game_id, player_id, str(e)
             )
-            logger.error(f"State extraction failed: {error_response}")
+            logger.error(f"Error response: {error_response}")
             raise
+        except Exception as e:
+            # Convert unexpected exceptions to StateExtractionError
+            logger.error(f"Unexpected error during state extraction: {e}", exc_info=True)
+            raise StateExtractionError(
+                f"Unexpected error during state extraction: {e}",
+                game_id=game_id,
+                player_id=player_id,
+                cause=e
+            )
 
     def get_legal_actions(self, game_id: str, player_id: int) -> List[Dict[str, Any]]:
         """
@@ -147,10 +360,7 @@ class StateExtractor:
         try:
             civcom = self._get_civcom_for_game(game_id)
             if not civcom:
-                # Try registry function if available
-                civcom = self._get_civcom_registry(game_id)
-            if not civcom:
-                raise Exception(f"No civcom available for game {game_id}")
+                raise CivComNotFoundError(game_id)
 
             # For now, generate mock actions based on game state
             # In a full implementation, this would extract from the actual game
@@ -161,12 +371,23 @@ class StateExtractor:
             sorted_actions = sorted(all_actions, key=lambda x: x.get('priority', 0), reverse=True)
             return sorted_actions[:20]
 
-        except Exception as e:
+        except (CivComNotFoundError, StateExtractionError) as e:
+            # Re-raise specific exceptions with preserved context
+            logger.error(f"Legal actions extraction failed for game {game_id}, player {player_id}: {e}")
             error_response = error_handler.handle_action_extraction_error(
                 game_id, player_id, str(e)
             )
-            logger.error(f"Legal actions extraction failed: {error_response}")
+            logger.error(f"Error response: {error_response}")
             raise
+        except Exception as e:
+            # Convert unexpected exceptions to StateExtractionError
+            logger.error(f"Unexpected error during legal actions extraction: {e}", exc_info=True)
+            raise StateExtractionError(
+                f"Unexpected error during legal actions extraction: {e}",
+                game_id=game_id,
+                player_id=player_id,
+                cause=e
+            )
 
     def _extract_delta_state(self, game_id: str, player_id: int, since_turn: int, civcom: CivCom) -> Dict[str, Any]:
         """Extract changes since specified turn"""
@@ -182,57 +403,94 @@ class StateExtractor:
         }
 
     def _calculate_state_delta(self, previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
-        """Calculate differences between two game states"""
+        """
+        Calculate differences between two game states
+        Optimized for performance with O(1) lookups and set operations
+        """
         changes = {}
 
-        # Track unit changes
+        # Track unit changes - O(n) complexity
         prev_units = {u['id']: u for u in previous.get('units', [])}
         curr_units = {u['id']: u for u in current.get('units', [])}
 
-        unit_changes = []
-        for unit_id, unit in curr_units.items():
-            if unit_id in prev_units:
-                prev_unit = prev_units[unit_id]
-                if (unit['x'] != prev_unit['x'] or unit['y'] != prev_unit['y'] or
-                    unit['hp'] != prev_unit['hp']):
-                    unit_changes.append({
-                        'id': unit_id,
-                        'changes': {
-                            'position': {'from': (prev_unit['x'], prev_unit['y']),
-                                       'to': (unit['x'], unit['y'])},
-                            'hp': {'from': prev_unit['hp'], 'to': unit['hp']}
-                        }
-                    })
-            else:
-                unit_changes.append({'id': unit_id, 'type': 'created', 'data': unit})
+        # Use sets for efficient difference operations
+        prev_unit_ids = set(prev_units.keys())
+        curr_unit_ids = set(curr_units.keys())
 
-        # Check for destroyed units
-        for unit_id in prev_units:
-            if unit_id not in curr_units:
-                unit_changes.append({'id': unit_id, 'type': 'destroyed'})
+        unit_changes = []
+
+        # Modified/existing units - O(n) where n = current units
+        for unit_id in (prev_unit_ids & curr_unit_ids):  # Intersection
+            unit = curr_units[unit_id]
+            prev_unit = prev_units[unit_id]
+
+            # Check only relevant fields for changes
+            position_changed = unit['x'] != prev_unit['x'] or unit['y'] != prev_unit['y']
+            hp_changed = unit['hp'] != prev_unit['hp']
+            moves_changed = unit.get('moves', 0) != prev_unit.get('moves', 0)
+
+            if position_changed or hp_changed or moves_changed:
+                change_data = {'id': unit_id, 'changes': {}}
+
+                if position_changed:
+                    change_data['changes']['position'] = {
+                        'from': (prev_unit['x'], prev_unit['y']),
+                        'to': (unit['x'], unit['y'])
+                    }
+                if hp_changed:
+                    change_data['changes']['hp'] = {'from': prev_unit['hp'], 'to': unit['hp']}
+                if moves_changed:
+                    change_data['changes']['moves'] = {
+                        'from': prev_unit.get('moves', 0), 'to': unit.get('moves', 0)
+                    }
+
+                unit_changes.append(change_data)
+
+        # New units - O(k) where k = new units
+        for unit_id in (curr_unit_ids - prev_unit_ids):  # Difference
+            unit_changes.append({'id': unit_id, 'type': 'created', 'data': curr_units[unit_id]})
+
+        # Destroyed units - O(j) where j = destroyed units
+        for unit_id in (prev_unit_ids - curr_unit_ids):  # Difference
+            unit_changes.append({'id': unit_id, 'type': 'destroyed'})
 
         if unit_changes:
             changes['units'] = unit_changes
 
-        # Track city changes
+        # Track city changes - same optimization pattern
         prev_cities = {c['id']: c for c in previous.get('cities', [])}
         curr_cities = {c['id']: c for c in current.get('cities', [])}
 
+        prev_city_ids = set(prev_cities.keys())
+        curr_city_ids = set(curr_cities.keys())
+
         city_changes = []
-        for city_id, city in curr_cities.items():
-            if city_id in prev_cities:
-                prev_city = prev_cities[city_id]
-                if (city['population'] != prev_city['population'] or
-                    city['production'] != prev_city['production']):
-                    city_changes.append({
-                        'id': city_id,
-                        'changes': {
-                            'population': {'from': prev_city['population'], 'to': city['population']},
-                            'production': {'from': prev_city['production'], 'to': city['production']}
-                        }
-                    })
-            else:
-                city_changes.append({'id': city_id, 'type': 'founded', 'data': city})
+
+        # Modified/existing cities
+        for city_id in (prev_city_ids & curr_city_ids):
+            city = curr_cities[city_id]
+            prev_city = prev_cities[city_id]
+
+            pop_changed = city['population'] != prev_city['population']
+            prod_changed = city.get('production') != prev_city.get('production')
+
+            if pop_changed or prod_changed:
+                change_data = {'id': city_id, 'changes': {}}
+
+                if pop_changed:
+                    change_data['changes']['population'] = {
+                        'from': prev_city['population'], 'to': city['population']
+                    }
+                if prod_changed:
+                    change_data['changes']['production'] = {
+                        'from': prev_city.get('production'), 'to': city.get('production')
+                    }
+
+                city_changes.append(change_data)
+
+        # New cities
+        for city_id in (curr_city_ids - prev_city_ids):
+            city_changes.append({'id': city_id, 'type': 'founded', 'data': curr_cities[city_id]})
 
         if city_changes:
             changes['cities'] = city_changes
@@ -537,23 +795,53 @@ class StateExtractorHandler(web.RequestHandler):
                 self.write({"error": "player_id parameter is required"})
                 return
 
-            player_id = int(player_id)
             format_str = self.get_argument('format', 'full')
             since_turn = self.get_argument('since_turn', None)
 
-            if since_turn is not None:
-                since_turn = int(since_turn)
+            # Authenticate request
+            authenticated, auth_player_id, auth_game_id, auth_error = authenticate_request(self, 'state_read')
+            if not authenticated:
+                self.set_status(401)
+                self.write({"error": auth_error})
+                return
 
-            # Validate format
+            # If authentication provides player info, validate it matches request
+            if auth_player_id is not None and player_id != str(auth_player_id):
+                self.set_status(403)
+                self.write({"error": "Player ID in request does not match authenticated user"})
+                return
+
+            # Validate all parameters
             try:
-                format_type = StateFormat(format_str)
-            except ValueError:
+                validated_game_id, validated_player_id, validated_format, validated_since_turn = validate_request_parameters(
+                    game_id, player_id, format_str, since_turn
+                )
+                format_type = StateFormat(validated_format)
+            except ValidationError as e:
+                logger.warning(f"Request validation failed: {e}")
                 self.set_status(400)
-                self.write({"error": f"Invalid format: {format_str}. Must be one of: full, delta, llm_optimized"})
+                self.write({"error": str(e)})
+                return
+
+            # Check rate limits
+            client_ip = self.request.remote_ip or "unknown"
+            rate_limit_allowed, retry_after, limit_type = api_rate_limiter.check_limits(
+                validated_player_id, client_ip
+            )
+
+            if not rate_limit_allowed:
+                self.set_status(429)
+                if retry_after:
+                    self.set_header("Retry-After", str(int(retry_after) + 1))
+                self.write({
+                    "error": f"Rate limit exceeded for {limit_type}",
+                    "retry_after": retry_after,
+                    "limit_type": limit_type
+                })
                 return
 
             # Extract state asynchronously
-            state = await self._extract_state_async(game_id, player_id, format_type, since_turn)
+            state = await self._extract_state_async(validated_game_id, validated_player_id, format_type, validated_since_turn)
 
             self.set_header("Content-Type", "application/json")
             self.write(state)
@@ -602,10 +890,49 @@ class LegalActionsHandler(web.RequestHandler):
                 self.write({"error": "player_id parameter is required"})
                 return
 
-            player_id = int(player_id)
+            # Authenticate request
+            authenticated, auth_player_id, auth_game_id, auth_error = authenticate_request(self, 'actions_read')
+            if not authenticated:
+                self.set_status(401)
+                self.write({"error": auth_error})
+                return
+
+            # If authentication provides player info, validate it matches request
+            if auth_player_id is not None and player_id != str(auth_player_id):
+                self.set_status(403)
+                self.write({"error": "Player ID in request does not match authenticated user"})
+                return
+
+            # Validate parameters
+            try:
+                validated_game_id, validated_player_id, _, _ = validate_request_parameters(
+                    game_id, player_id, 'full', None
+                )
+            except ValidationError as e:
+                logger.warning(f"Request validation failed: {e}")
+                self.set_status(400)
+                self.write({"error": str(e)})
+                return
+
+            # Check rate limits
+            client_ip = self.request.remote_ip or "unknown"
+            rate_limit_allowed, retry_after, limit_type = api_rate_limiter.check_limits(
+                validated_player_id, client_ip
+            )
+
+            if not rate_limit_allowed:
+                self.set_status(429)
+                if retry_after:
+                    self.set_header("Retry-After", str(int(retry_after) + 1))
+                self.write({
+                    "error": f"Rate limit exceeded for {limit_type}",
+                    "retry_after": retry_after,
+                    "limit_type": limit_type
+                })
+                return
 
             # Extract actions asynchronously
-            actions = await self._get_actions_async(game_id, player_id)
+            actions = await self._get_actions_async(validated_game_id, validated_player_id)
 
             self.set_header("Content-Type", "application/json")
             self.write(actions)

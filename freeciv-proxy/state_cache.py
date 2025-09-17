@@ -13,8 +13,9 @@ import hmac
 import hashlib
 import os
 import gzip
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, OrderedDict
 from dataclasses import dataclass
+from collections import OrderedDict
 
 logger = logging.getLogger("freeciv-proxy")
 
@@ -29,6 +30,7 @@ class CacheEntry:
     signature: str = ""  # HMAC signature for integrity
     is_compressed: bool = False  # Whether data is compressed
     compressed_data: Optional[bytes] = None  # Compressed data if applicable
+    last_accessed: float = 0.0  # For LRU tracking
 
 class StateCache:
     """
@@ -36,13 +38,25 @@ class StateCache:
     Optimizes game state queries to meet < 4KB and < 50ms requirements
     """
 
-    def __init__(self, ttl: int = 5, max_size_kb: int = 4, enable_compression: bool = True):
+    def __init__(self, ttl: int = 5, max_size_kb: int = 4, enable_compression: bool = True,
+                 max_cache_size_mb: int = 100, max_entries: int = 1000):
         self.ttl = ttl  # Time-to-live in seconds
-        self.max_size_bytes = max_size_kb * 1024
+        self.max_size_bytes = max_size_kb * 1024  # Max size per entry
+        self.max_cache_size_bytes = max_cache_size_mb * 1024 * 1024  # Max total cache size
+        self.max_entries = max_entries  # Maximum number of entries
         self.enable_compression = enable_compression
-        self.cache: Dict[str, CacheEntry] = {}
+
+        # Configurable compression settings
+        self.compression_threshold = int(os.getenv('CACHE_COMPRESSION_THRESHOLD', '1024'))  # bytes
+        self.compression_level = int(os.getenv('CACHE_COMPRESSION_LEVEL', '6'))  # 1-9
+        self.compression_ratio_threshold = float(os.getenv('CACHE_COMPRESSION_RATIO_THRESHOLD', '0.8'))  # 0.0-1.0
+
+        # Use OrderedDict for efficient LRU operations
+        self.cache: OrderedDict[str, CacheEntry] = OrderedDict()
+
         self.hit_count = 0
         self.miss_count = 0
+        self.eviction_count = 0
 
         # Performance metrics
         self.compression_ratio_sum = 0.0
@@ -51,18 +65,38 @@ class StateCache:
         # HMAC secret for cache integrity - required for security
         self.hmac_secret = os.getenv('CACHE_HMAC_SECRET')
         if not self.hmac_secret:
-            raise ValueError("CACHE_HMAC_SECRET environment variable must be set for cache integrity")
-        if len(self.hmac_secret) < 32:
-            raise ValueError("CACHE_HMAC_SECRET must be at least 32 characters long for security")
+            raise ValueError(
+                "CACHE_HMAC_SECRET environment variable must be set for cache integrity. "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        if len(self.hmac_secret) < 64:
+            raise ValueError(
+                "CACHE_HMAC_SECRET must be at least 64 characters long for security (512 bits). "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+
+        # Check for weak secrets (repeated characters or predictable patterns)
+        if len(set(self.hmac_secret)) < 16:  # Less than 16 unique characters suggests weak entropy
+            raise ValueError(
+                "CACHE_HMAC_SECRET appears to have low entropy. Use a cryptographically secure random string. "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """Get cached state with TTL and integrity check"""
+        """Get cached state with TTL and integrity check, updates LRU order"""
         if key in self.cache:
             entry = self.cache[key]
-            if time.time() - entry.timestamp < self.ttl:
+            current_time = time.time()
+
+            if current_time - entry.timestamp < self.ttl:
                 # Verify cache integrity
                 if self._verify_cache_integrity(entry):
                     self.hit_count += 1
+                    entry.last_accessed = current_time
+
+                    # Move to end for LRU (most recently used)
+                    self.cache.move_to_end(key)
+
                     logger.debug(f"Cache hit for key: {key}")
 
                     # Handle decompression if needed
@@ -103,13 +137,13 @@ class StateCache:
         compressed_data = None
         final_size = original_size
 
-        if self.enable_compression and original_size > 1024:  # Only compress if > 1KB
+        if self.enable_compression and original_size > self.compression_threshold:
             try:
-                compressed_data = gzip.compress(serialized_bytes, compresslevel=6)
+                compressed_data = gzip.compress(serialized_bytes, compresslevel=self.compression_level)
                 compressed_size = len(compressed_data)
 
-                # Use compression if it provides significant savings (>20%)
-                if compressed_size < original_size * 0.8:
+                # Use compression if it provides significant savings
+                if compressed_size < original_size * self.compression_ratio_threshold:
                     final_size = compressed_size
                     compression_ratio = original_size / compressed_size
                     self.compression_ratio_sum += compression_ratio
@@ -125,20 +159,29 @@ class StateCache:
             logger.warning(f"State too large for cache: {final_size} bytes (max: {self.max_size_bytes})")
             return False
 
+        # Check if we need to evict entries before adding
+        self._ensure_cache_capacity(final_size)
+
         # Generate HMAC signature for integrity
         signature = self._generate_signature(optimized, player_id, key)
+        current_time = time.time()
 
         # Store in cache with signature
-        self.cache[key] = CacheEntry(
+        entry = CacheEntry(
             data=optimized if compressed_data is None else None,  # Store original data only if not compressed
-            timestamp=time.time(),
+            timestamp=current_time,
             size_bytes=final_size,
             player_id=player_id,
             cache_key=key,
             signature=signature,
             is_compressed=compressed_data is not None,
-            compressed_data=compressed_data
+            compressed_data=compressed_data,
+            last_accessed=current_time
         )
+
+        self.cache[key] = entry
+        # Move to end (most recently used)
+        self.cache.move_to_end(key)
 
         logger.debug(f"Cached state for key: {key}, size: {final_size} bytes")
         return True
@@ -239,6 +282,34 @@ class StateCache:
 
         return optimized
 
+    def _ensure_cache_capacity(self, new_entry_size: int):
+        """
+        Ensure cache has capacity for new entry, evicting LRU entries if needed
+        """
+        current_size = self._get_total_cache_size()
+
+        # Check if we need to evict based on total size or entry count
+        while (len(self.cache) >= self.max_entries or
+               current_size + new_entry_size > self.max_cache_size_bytes):
+
+            if not self.cache:
+                break  # No entries to evict
+
+            # Remove least recently used entry (first in OrderedDict)
+            lru_key, lru_entry = self.cache.popitem(last=False)
+            current_size -= lru_entry.size_bytes
+            self.eviction_count += 1
+
+            logger.debug(f"Evicted LRU cache entry: {lru_key} (size: {lru_entry.size_bytes} bytes)")
+
+            # Safety check to prevent infinite loop
+            if len(self.cache) == 0:
+                break
+
+    def _get_total_cache_size(self) -> int:
+        """Calculate total cache size in bytes"""
+        return sum(entry.size_bytes for entry in self.cache.values())
+
     def _generate_signature(self, data: Dict[str, Any], player_id: int, cache_key: str) -> str:
         """Generate HMAC signature for cache entry integrity"""
         # Create message to sign (data + metadata)
@@ -279,13 +350,28 @@ class StateCache:
         """Get cache performance statistics"""
         total_requests = self.hit_count + self.miss_count
         hit_rate = self.hit_count / total_requests if total_requests > 0 else 0
+        avg_compression_ratio = (self.compression_ratio_sum / self.compression_count
+                               if self.compression_count > 0 else 1.0)
+
+        total_size = self._get_total_cache_size()
+        cache_utilization = total_size / self.max_cache_size_bytes if self.max_cache_size_bytes > 0 else 0
 
         return {
             'hit_count': self.hit_count,
             'miss_count': self.miss_count,
             'hit_rate': hit_rate,
-            'cache_size': len(self.cache),
-            'total_size_bytes': sum(entry.size_bytes for entry in self.cache.values())
+            'eviction_count': self.eviction_count,
+            'cache_entries': len(self.cache),
+            'total_size_bytes': total_size,
+            'max_cache_size_bytes': self.max_cache_size_bytes,
+            'cache_utilization_percent': cache_utilization * 100,
+            'max_entries': self.max_entries,
+            'average_compression_ratio': avg_compression_ratio,
+            'compression_enabled': self.enable_compression,
+            'compression_threshold_bytes': self.compression_threshold,
+            'compression_level': self.compression_level,
+            'compression_ratio_threshold': self.compression_ratio_threshold,
+            'ttl_seconds': self.ttl
         }
 
     def clear(self):
@@ -293,6 +379,9 @@ class StateCache:
         self.cache.clear()
         self.hit_count = 0
         self.miss_count = 0
+        self.eviction_count = 0
+        self.compression_ratio_sum = 0.0
+        self.compression_count = 0
         logger.info("Cache cleared")
 
 # Global cache instance
