@@ -92,6 +92,42 @@ class InputSanitizer:
             raise SecurityError(f"Invalid coordinate type: ({x}, {y})")
 
     @classmethod
+    def sanitize_game_id(cls, value: Any) -> str:
+        """Sanitize and validate game ID"""
+        if not isinstance(value, str):
+            raise SecurityError(f"Invalid game_id type: {type(value)}")
+        
+        # Check for SQL injection patterns
+        cls._check_sql_injection(value, 'game_id')
+        
+        # Game ID pattern: alphanumeric, underscore, hyphen, max 50 chars
+        pattern = r'^[a-zA-Z0-9_-]{1,50}$'
+        if not re.match(pattern, value):
+            raise SecurityError(f"Invalid game_id format: {value}")
+        
+        return value
+    
+    @classmethod
+    def sanitize_string(cls, value: Any, max_length: int = 100) -> str:
+        """Sanitize and validate general string input"""
+        if not isinstance(value, str):
+            raise SecurityError(f"Invalid string type: {type(value)}")
+        
+        # Check for SQL injection patterns
+        cls._check_sql_injection(value, 'string')
+        
+        # Basic alphanumeric with underscore, max length
+        if len(value) > max_length:
+            raise SecurityError(f"String too long: {len(value)} > {max_length}")
+        
+        # Allow basic characters for action names
+        pattern = r'^[a-zA-Z0-9_]{1,' + str(max_length) + '}$'
+        if not re.match(pattern, value):
+            raise SecurityError(f"Invalid string format: {value}")
+        
+        return value
+
+    @classmethod
     def sanitize_string_field(cls, value: Any, field_type: str, max_length: int = None) -> str:
         """Sanitize and validate string fields"""
         if not isinstance(value, str):

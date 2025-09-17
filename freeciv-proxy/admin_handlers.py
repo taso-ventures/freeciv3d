@@ -10,6 +10,7 @@ import json
 import logging
 from tornado import web
 from auth import authenticator
+from security import InputSanitizer, SecurityError
 
 logger = logging.getLogger("freeciv-proxy")
 
@@ -27,9 +28,15 @@ class AdminAuthHandler(web.RequestHandler):
                 self.write({"error": "Admin access required"})
                 return
 
-            action = self.get_argument('action')
-            player_id = int(self.get_argument('player_id'))
-            game_id = self.get_argument('game_id', 'global')
+            try:
+                action = InputSanitizer.sanitize_string(self.get_argument('action'))
+                player_id = InputSanitizer.sanitize_player_id(self.get_argument('player_id'))
+                game_id = InputSanitizer.sanitize_game_id(self.get_argument('game_id', 'global'))
+            except SecurityError as e:
+                logger.warning(f"Input validation failed: {e}")
+                self.set_status(400)
+                self.write({"error": "Invalid input parameters"})
+                return
 
             if action == 'create_api_key':
                 api_key = authenticator.generate_api_key(player_id, game_id)
@@ -66,7 +73,7 @@ class AdminAuthHandler(web.RequestHandler):
         except Exception as e:
             logger.error(f"Admin auth error: {e}")
             self.set_status(500)
-            self.write({"error": str(e)})
+            self.write({"error": "Internal server error"})
 
     async def get(self):
         """Get authentication statistics"""
@@ -85,4 +92,4 @@ class AdminAuthHandler(web.RequestHandler):
         except Exception as e:
             logger.error(f"Admin auth stats error: {e}")
             self.set_status(500)
-            self.write({"error": str(e)})
+            self.write({"error": "Internal server error"})

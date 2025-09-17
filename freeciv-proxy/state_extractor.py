@@ -802,7 +802,7 @@ class StateExtractorHandler(web.RequestHandler):
             authenticated, auth_player_id, auth_game_id, auth_error = authenticate_request(self, 'state_read')
             if not authenticated:
                 self.set_status(401)
-                self.write({"error": auth_error})
+                self.write({"error": "Authentication required"})
                 return
 
             # If authentication provides player info, validate it matches request
@@ -850,7 +850,7 @@ class StateExtractorHandler(web.RequestHandler):
             # Invalid format or other validation errors
             logger.warning(f"Validation error in StateExtractorHandler: {str(e)}")
             self.set_status(400)
-            self.write({"error": str(e)})
+            self.write({"error": "Invalid request parameters"})
         except Exception as e:
             error_message = str(e)
             logger.error(f"Error in StateExtractorHandler: {error_message}")
@@ -894,7 +894,7 @@ class LegalActionsHandler(web.RequestHandler):
             authenticated, auth_player_id, auth_game_id, auth_error = authenticate_request(self, 'actions_read')
             if not authenticated:
                 self.set_status(401)
-                self.write({"error": auth_error})
+                self.write({"error": "Authentication required"})
                 return
 
             # If authentication provides player info, validate it matches request

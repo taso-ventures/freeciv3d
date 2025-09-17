@@ -85,7 +85,7 @@ class HealthCheckHandler(web.RequestHandler):
             self.set_status(503)
             self.write({
                 "status": "unhealthy",
-                "error": str(e),
+                "error": "Service unavailable",
                 "timestamp": time.time()
             })
 
@@ -173,7 +173,7 @@ class MetricsHandler(web.RequestHandler):
         except Exception as e:
             logger.error(f"Metrics generation failed: {e}")
             self.set_status(500)
-            self.write(f"# Error generating metrics: {e}")
+            self.write("# Error generating metrics")
 
 
 class StatsHandler(web.RequestHandler):
@@ -218,4 +218,4 @@ class StatsHandler(web.RequestHandler):
         except Exception as e:
             logger.error(f"Stats generation failed: {e}")
             self.set_status(500)
-            self.write({"error": str(e)})
+            self.write({"error": "Internal server error"})

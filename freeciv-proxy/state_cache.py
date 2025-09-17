@@ -108,14 +108,14 @@ class StateCache:
                             logger.error(f"Decompression failed for key {key}: {e}")
                             del self.cache[key]
                             return None
-                    else:
-                        return entry.data
-                else:
-                    # Cache poisoning detected, remove entry
-                    del self.cache[key]
-                    logger.error(f"Cache integrity violation detected for key: {key}")
-                    self.miss_count += 1
-                    return None
+                    
+                    return entry.data
+                
+                # Cache poisoning detected, remove entry
+                del self.cache[key]
+                logger.error(f"Cache integrity violation detected for key: {key}")
+                self.miss_count += 1
+                return None
             else:
                 # TTL expired, remove entry
                 del self.cache[key]

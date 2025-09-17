@@ -70,7 +70,7 @@ class SimpleAuthenticator:
         # Create payload with player info and timestamp
         payload = f"{player_id}:{game_id}:{int(time.time())}"
 
-        # Generate HMAC signature
+        # Generate HMAC signature (SHA256 is secure for HMAC signatures)
         signature = hmac.new(
             self.api_key_secret.encode(),
             payload.encode(),
@@ -102,7 +102,7 @@ class SimpleAuthenticator:
 
             payload, provided_signature = parts
 
-            # Generate expected signature
+            # Generate expected signature (SHA256 is secure for HMAC signatures)
             expected_signature = hmac.new(
                 self.api_key_secret.encode(),
                 payload.encode(),

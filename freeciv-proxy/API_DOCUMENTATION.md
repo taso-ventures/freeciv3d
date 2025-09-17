@@ -2,7 +2,7 @@
 
 ## Overview
 
-The State Extraction Service provides REST API endpoints for extracting and optimizing FreeCiv game state for LLM consumption. This service implements the requirements from Linear ticket AGE-166.
+The State Extraction Service provides REST API endpoints for extracting and optimizing FreeCiv game state for LLM consumption.
 
 ## Base URL
 
