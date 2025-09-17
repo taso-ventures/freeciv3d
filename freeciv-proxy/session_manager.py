@@ -373,22 +373,18 @@ class SessionManager:
             if bcrypt:
                 # bcrypt handles salt and timing attacks internally
                 return bcrypt.checkpw(token.encode('utf-8'), stored_hash.encode('utf-8'))
-            else:
-                # PBKDF2 verification
-                if ':' not in stored_hash:
-                    # Legacy format - fall back to HMAC comparison
-                    legacy_hash = hmac.new(
-                        self.session_secret.encode('utf-8'),
-                        token.encode('utf-8'),
-                        hashlib.sha256
-                    ).hexdigest()
-                    return hmac.compare_digest(stored_hash, legacy_hash)
+            
+            # PBKDF2 verification - requires salt:hash format
+            if ':' not in stored_hash:
+                # Legacy format detected - reject for security
+                logger.warning("Legacy hash format detected - rejecting for security")
+                return False
 
-                salt_hex, key_hex = stored_hash.split(':', 1)
-                salt = bytes.fromhex(salt_hex)
-                stored_key = bytes.fromhex(key_hex)
-                new_key = hashlib.pbkdf2_hmac('sha256', token.encode('utf-8'), salt, 100000)
-                return hmac.compare_digest(stored_key, new_key)
+            salt_hex, key_hex = stored_hash.split(':', 1)
+            salt = bytes.fromhex(salt_hex)
+            stored_key = bytes.fromhex(key_hex)
+            new_key = hashlib.pbkdf2_hmac('sha256', token.encode('utf-8'), salt, 100000)
+            return hmac.compare_digest(stored_key, new_key)
         except Exception as e:
             logger.error(f"Token verification error: {e}")
             return False

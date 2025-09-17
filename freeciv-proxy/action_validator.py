@@ -270,10 +270,9 @@ class LLMActionValidator:
 
             if not (0 <= x < max_x and 0 <= y < max_y):
                 return False
-        else:
+        elif not (0 <= x <= 200 and 0 <= y <= 200):
             # Fallback to more reasonable coordinate bounds when no game state
             # Accept coordinates from 0 to 200 (reasonable for most game maps)
-            if not (0 <= x <= 200 and 0 <= y <= 200):
-                return False
+            return False
 
         return True
