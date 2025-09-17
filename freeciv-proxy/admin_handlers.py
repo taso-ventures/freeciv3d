@@ -25,9 +25,11 @@ class AdminAuthHandler(web.RequestHandler):
             admin_key = self.get_argument('admin_key', None)
             if admin_key != "admin-secret-key":  # Replace with proper admin auth
                 self.set_status(403)
+                self.set_header("Content-Type", "application/json")
                 self.write({"error": "Admin access required"})
                 return
 
+            self.set_header("Content-Type", "application/json")
             try:
                 action = InputSanitizer.sanitize_string(self.get_argument('action'))
                 player_id = InputSanitizer.sanitize_player_id(self.get_argument('player_id'))
@@ -70,6 +72,7 @@ class AdminAuthHandler(web.RequestHandler):
                 self.set_status(400)
                 self.write({"error": "Invalid action"})
 
+            self.set_header("Content-Type", "application/json")
         except Exception as e:
             logger.error(f"Admin auth error: {e}")
             self.set_status(500)
