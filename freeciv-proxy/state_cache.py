@@ -13,6 +13,7 @@ import hmac
 import hashlib
 import os
 import gzip
+import math
 from typing import Dict, Any, Optional, OrderedDict
 from dataclasses import dataclass
 from collections import OrderedDict
@@ -75,10 +76,13 @@ class StateCache:
                 "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
             )
 
-        # Check for weak secrets (repeated characters or predictable patterns)
-        if len(set(self.hmac_secret)) < 16:  # Less than 16 unique characters suggests weak entropy
+        # Check for weak secrets using Shannon entropy
+        entropy = self._calculate_shannon_entropy(self.hmac_secret)
+        min_entropy = 3.5  # Minimum bits per character (hex = ~3.88, mixed case = ~5.95)
+        if entropy < min_entropy:
             raise ValueError(
-                "CACHE_HMAC_SECRET appears to have low entropy. Use a cryptographically secure random string. "
+                f"CACHE_HMAC_SECRET has insufficient entropy: {entropy:.2f} bits/char (minimum: {min_entropy}). "
+                "Use a cryptographically secure random string. "
                 "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
             )
 
@@ -345,6 +349,35 @@ class StateCache:
         except Exception as e:
             logger.error(f"Error verifying cache integrity: {e}")
             return False
+
+    def _calculate_shannon_entropy(self, data: str) -> float:
+        """
+        Calculate Shannon entropy of a string in bits per character
+
+        Args:
+            data: Input string to analyze
+
+        Returns:
+            float: Shannon entropy in bits per character (0.0 to ~8.0 for ASCII)
+        """
+        if not data:
+            return 0.0
+
+        # Count frequency of each character
+        char_counts = {}
+        for char in data:
+            char_counts[char] = char_counts.get(char, 0) + 1
+
+        # Calculate Shannon entropy
+        entropy = 0.0
+        data_len = len(data)
+
+        for count in char_counts.values():
+            probability = count / data_len
+            if probability > 0:
+                entropy -= probability * math.log2(probability)
+
+        return entropy
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache performance statistics"""

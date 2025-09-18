@@ -159,12 +159,23 @@ def authenticate_request(request_handler, required_permission: str = 'state_read
     Returns:
         tuple: (authenticated: bool, player_id: Optional[int], game_id: Optional[str], error_message: str)
     """
-    # Check if authentication is enabled
-    auth_enabled = os.getenv('AUTH_ENABLED', 'false').lower() == 'true'
+    # Check environment and authentication settings
+    environment = os.getenv('ENVIRONMENT', 'production').lower()
+    auth_enabled = os.getenv('AUTH_ENABLED', 'true').lower() == 'true'
+
+    # Only allow authentication bypass in development environment
     if not auth_enabled:
-        # Authentication disabled, allow request but log warning
-        logger.debug("Authentication disabled, allowing request")
-        return True, None, None, ""
+        if environment == 'development':
+            # Authentication disabled in development, allow but warn
+            logger.warning(f"Authentication bypassed in development mode for {request_handler.request.remote_ip}")
+            # Add warning header to response
+            request_handler.set_header("X-Auth-Bypassed", "true")
+            request_handler.set_header("X-Environment", "development")
+            return True, None, None, ""
+        else:
+            # Force authentication in production/staging regardless of AUTH_ENABLED setting
+            logger.error(f"Authentication bypass attempted in {environment} environment - BLOCKED")
+            # Continue to authentication logic below
 
     try:
         # Get authentication credentials from headers or query params
