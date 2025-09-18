@@ -689,7 +689,7 @@ class StateExtractor:
             return {"status": "no_units", "strength": 0}
 
         total_hp = sum(u['hp'] for u in units)
-        avg_hp = total_hp / len(units)
+        avg_hp = total_hp / len(units) if len(units) > 0 else 0
 
         return {
             "unit_count": len(units),
@@ -702,7 +702,7 @@ class StateExtractor:
         if not cities:
             return "none"
 
-        avg_pop = sum(c['population'] for c in cities) / len(cities)
+        avg_pop = sum(c['population'] for c in cities) / len(cities) if len(cities) > 0 else 0
         return "high" if avg_pop < 5 else "moderate" if avg_pop < 10 else "limited"
 
     def _assess_development_level(self, cities: List[Dict]) -> str:

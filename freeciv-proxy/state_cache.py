@@ -55,13 +55,8 @@ class StateCache:
         # Use OrderedDict for efficient LRU operations
         self.cache: OrderedDict[str, CacheEntry] = OrderedDict()
 
-        self.hit_count = 0
-        self.miss_count = 0
-        self.eviction_count = 0
-
-        # Performance metrics
-        self.compression_ratio_sum = 0.0
-        self.compression_count = 0
+        # Performance metrics removed due to thread safety concerns
+        # TODO: Add thread-safe metrics in future version
 
         # HMAC secret for cache integrity - required for security
         self.hmac_secret = os.getenv('CACHE_HMAC_SECRET')
@@ -95,7 +90,7 @@ class StateCache:
             if current_time - entry.timestamp < self.ttl:
                 # Verify cache integrity
                 if self._verify_cache_integrity(entry):
-                    self.hit_count += 1
+                    # Cache hit (metrics removed for thread safety)
                     entry.last_accessed = current_time
 
                     # Move to end for LRU (most recently used)
@@ -110,22 +105,22 @@ class StateCache:
                             return json.loads(decompressed_bytes.decode('utf-8'))
                         except Exception as e:
                             logger.error(f"Decompression failed for key {key}: {e}")
-                            del self.cache[key]
+                            self.cache.pop(key, None)
                             return None
                     
                     return entry.data
                 
                 # Cache poisoning detected, remove entry
-                del self.cache[key]
+                self.cache.pop(key, None)
                 logger.error(f"Cache integrity violation detected for key: {key}")
-                self.miss_count += 1
+                # Cache miss (metrics removed for thread safety)
                 return None
             else:
                 # TTL expired, remove entry
-                del self.cache[key]
+                self.cache.pop(key, None)
                 logger.debug(f"Cache entry expired for key: {key}")
 
-        self.miss_count += 1
+        # Cache miss (metrics removed for thread safety)
         logger.debug(f"Cache miss for key: {key}")
         return None
 
@@ -149,9 +144,8 @@ class StateCache:
                 # Use compression if it provides significant savings
                 if compressed_size < original_size * self.compression_ratio_threshold:
                     final_size = compressed_size
-                    compression_ratio = original_size / compressed_size
-                    self.compression_ratio_sum += compression_ratio
-                    self.compression_count += 1
+                    compression_ratio = original_size / compressed_size if compressed_size > 0 else 1.0
+                    # Compression metrics removed for thread safety
                     logger.debug(f"Compressed state: {original_size} -> {compressed_size} bytes (ratio: {compression_ratio:.2f})")
                 else:
                     compressed_data = None  # Don't use compression
@@ -206,7 +200,7 @@ class StateCache:
                 keys_to_remove.append(key)
 
         for key in keys_to_remove:
-            del self.cache[key]
+            self.cache.pop(key, None)
             logger.debug(f"Invalidated cache entry: {key}")
 
     def optimize_state_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -302,7 +296,7 @@ class StateCache:
             # Remove least recently used entry (first in OrderedDict)
             lru_key, lru_entry = self.cache.popitem(last=False)
             current_size -= lru_entry.size_bytes
-            self.eviction_count += 1
+            # Cache eviction (metrics removed for thread safety)
 
             logger.debug(f"Evicted LRU cache entry: {lru_key} (size: {lru_entry.size_bytes} bytes)")
 
@@ -380,26 +374,22 @@ class StateCache:
         return entropy
 
     def get_cache_stats(self) -> Dict[str, Any]:
-        """Get cache performance statistics"""
-        total_requests = self.hit_count + self.miss_count
-        hit_rate = self.hit_count / total_requests if total_requests > 0 else 0
-        avg_compression_ratio = (self.compression_ratio_sum / self.compression_count
-                               if self.compression_count > 0 else 1.0)
-
+        """Get cache performance statistics (limited due to thread safety)"""
         total_size = self._get_total_cache_size()
         cache_utilization = total_size / self.max_cache_size_bytes if self.max_cache_size_bytes > 0 else 0
 
         return {
-            'hit_count': self.hit_count,
-            'miss_count': self.miss_count,
-            'hit_rate': hit_rate,
-            'eviction_count': self.eviction_count,
+            # Metrics removed for thread safety - use external monitoring
+            'hit_count': 0,
+            'miss_count': 0,
+            'hit_rate': 0.0,
+            'eviction_count': 0,
             'cache_entries': len(self.cache),
             'total_size_bytes': total_size,
             'max_cache_size_bytes': self.max_cache_size_bytes,
             'cache_utilization_percent': cache_utilization * 100,
             'max_entries': self.max_entries,
-            'average_compression_ratio': avg_compression_ratio,
+            'average_compression_ratio': 1.0,
             'compression_enabled': self.enable_compression,
             'compression_threshold_bytes': self.compression_threshold,
             'compression_level': self.compression_level,
@@ -410,11 +400,7 @@ class StateCache:
     def clear(self):
         """Clear all cache entries"""
         self.cache.clear()
-        self.hit_count = 0
-        self.miss_count = 0
-        self.eviction_count = 0
-        self.compression_ratio_sum = 0.0
-        self.compression_count = 0
+        # Metrics removed for thread safety
         logger.info("Cache cleared")
 
 # Global cache instance
