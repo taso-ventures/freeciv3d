@@ -44,6 +44,7 @@ public class ValidateUser extends HttpServlet {
 			throws IOException, ServletException {
 
 		String usernameOrEmail = request.getParameter("userstring");
+		response.setContentType("text/plain");
 
 		Connection conn = null;
 		try {
