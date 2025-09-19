@@ -1,0 +1,1 @@
+"""Tests for FreeCiv WebSocket Protocol Extensions"""
