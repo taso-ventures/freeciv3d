@@ -107,7 +107,7 @@ class SimpleAuthenticator:
                 self.api_key_secret.encode(),
                 payload.encode(),
                 hashlib.sha256
-            ).hexdigest()[:16]
+            ).hexdigest()  # Use full HMAC signature for security
 
             # Verify signature
             if not hmac.compare_digest(provided_signature, expected_signature):

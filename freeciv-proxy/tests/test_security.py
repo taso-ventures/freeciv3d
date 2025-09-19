@@ -639,5 +639,175 @@ class TestSecurityLogging(unittest.TestCase):
         self.assertIn('spamming-agent', message)
 
 
+class TestAuthenticationBypassPrevention(unittest.TestCase):
+    """Test prevention of authentication bypass attempts"""
+
+    def test_header_manipulation_bypass_attempt(self):
+        """Test that manipulating auth headers doesn't bypass authentication"""
+        # Simulate malicious headers that might bypass authentication
+        malicious_headers = [
+            {'X-Forwarded-User': 'admin'},
+            {'X-Auth-User': 'admin'},
+            {'X-Real-IP': '127.0.0.1'},
+            {'X-Forwarded-For': '127.0.0.1'},
+            {'Authorization': 'Bearer fake-token'},
+            {'Cookie': 'session=admin; authenticated=true'},
+        ]
+
+        # Mock request handler
+        mock_handler = Mock()
+        mock_handler.request = Mock()
+
+        for headers in malicious_headers:
+            mock_handler.request.headers = headers
+
+            # Import here to avoid circular import
+            from state_extractor import authenticate_request
+
+            with patch.dict('os.environ', {'AUTH_ENABLED': 'true', 'ENVIRONMENT': 'production'}):
+                authenticated, player_id, game_id, error = authenticate_request(mock_handler)
+                self.assertFalse(authenticated, f"Authentication bypassed with headers: {headers}")
+
+    def test_environment_based_bypass_protection(self):
+        """Test that auth bypass only works in development environment"""
+        mock_handler = Mock()
+
+        from state_extractor import authenticate_request
+
+        # Test production environment - should not allow bypass
+        with patch.dict('os.environ', {'AUTH_ENABLED': 'false', 'ENVIRONMENT': 'production'}):
+            authenticated, _, _, error = authenticate_request(mock_handler)
+            self.assertFalse(authenticated)
+            self.assertIn("Authentication required", error)
+
+        # Test development environment - should allow bypass
+        with patch.dict('os.environ', {'AUTH_ENABLED': 'false', 'ENVIRONMENT': 'development'}):
+            authenticated, _, _, error = authenticate_request(mock_handler)
+            self.assertTrue(authenticated)
+
+    def test_hmac_signature_tampering(self):
+        """Test that tampered HMAC signatures are rejected"""
+        from admin_handlers import validate_admin_token
+
+        # Create a valid token structure but with wrong signature
+        import time
+        timestamp = int(time.time())
+        valid_timestamp = str(timestamp)
+        tampered_signature = "tampered_signature_12345"
+
+        tampered_token = f"{valid_timestamp}_{tampered_signature}"
+
+        with patch.dict('os.environ', {'ADMIN_KEY_SECRET': 'test-secret-key-for-testing'}):
+            result = validate_admin_token(tampered_token)
+            self.assertFalse(result, "Tampered HMAC signature should be rejected")
+
+
+class TestMalformedRequestHandling(unittest.TestCase):
+    """Test handling of malformed and edge case requests"""
+
+    def test_extremely_large_state_handling(self):
+        """Test handling of extremely large game states"""
+        # Create a very large state object
+        large_state = {
+            'cities': [{'id': i, 'name': f'city_{i}', 'population': 10} for i in range(10000)],
+            'units': [{'id': i, 'type': 'warrior', 'x': i % 100, 'y': i // 100} for i in range(50000)],
+            'technologies': [f'tech_{i}' for i in range(1000)]
+        }
+
+        cache = StateCache()
+
+        # Should reject extremely large states
+        with self.assertLogs(level='WARNING') as log:
+            result = cache.set('large_state', large_state, 1)
+            self.assertFalse(result)
+            self.assertTrue(any("too large" in msg for msg in log.output))
+
+    def test_malformed_json_in_requests(self):
+        """Test handling of malformed JSON in requests"""
+        validator = MessageValidator()
+
+        malformed_json_strings = [
+            '{"incomplete": json',  # Incomplete JSON
+            '{"duplicate": "key", "duplicate": "value"}',  # Duplicate keys
+            '{"number": 12345678901234567890123456789}',  # Number overflow
+            '{"nesting": ' + '{"level": ' * 1000 + 'true' + '}' * 1000,  # Deep nesting
+            '\x00\x01\x02invalid',  # Binary data
+            '{"unicode": "\uFFFF\uFFFE"}',  # Invalid unicode
+        ]
+
+        for malformed_json in malformed_json_strings:
+            with self.assertRaises(ValidationError):
+                validator.validate_message_content(malformed_json.encode())
+
+    def test_concurrent_cache_modifications(self):
+        """Test cache behavior under concurrent modifications"""
+        import concurrent.futures
+        import threading
+
+        cache = StateCache()
+
+        def cache_operation(operation_id):
+            """Perform cache operations concurrently"""
+            try:
+                # Set data
+                cache.set(f'key_{operation_id}', {'data': f'value_{operation_id}'}, operation_id % 8 + 1)
+
+                # Get data
+                result = cache.get(f'key_{operation_id}')
+
+                # Invalidate some data
+                if operation_id % 3 == 0:
+                    cache.invalidate(player_id=operation_id % 8 + 1)
+
+                return operation_id
+            except Exception as e:
+                return f"Error: {e}"
+
+        # Run concurrent operations
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(cache_operation, i) for i in range(100)]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+        # Should complete without deadlocks or corruption
+        error_count = sum(1 for r in results if isinstance(r, str) and r.startswith("Error"))
+        self.assertLess(error_count, 5, "Too many errors in concurrent operations")
+
+    def test_memory_exhaustion_protection(self):
+        """Test protection against memory exhaustion attacks"""
+        cache = StateCache(max_cache_size_mb=1)  # Very small cache
+
+        # Try to exhaust memory with many small entries
+        for i in range(1000):
+            state = {'data': 'x' * 1000, 'id': i}  # 1KB each
+            cache.set(f'key_{i}', state, i % 8 + 1)
+
+        # Cache should have limited entries due to eviction
+        cache_stats = cache.get_cache_stats()
+        self.assertLess(cache_stats['cache_entries'], 100, "Cache should evict entries to prevent memory exhaustion")
+
+    def test_invalid_authentication_tokens(self):
+        """Test handling of various invalid authentication tokens"""
+        from admin_handlers import validate_admin_token
+
+        invalid_tokens = [
+            None,
+            "",
+            "short",
+            "no_underscore_separator",
+            "multiple_underscores_in_token_structure",
+            "12345_validtimestamp_butmultiple_separators",
+            "notanumber_signature",
+            "12345_",  # Missing signature
+            "_signature_only",  # Missing timestamp
+            "\x00\x01invalid_chars_signature",
+            "a" * 10000,  # Extremely long token
+        ]
+
+        with patch.dict('os.environ', {'ADMIN_KEY_SECRET': 'test-secret-key-for-testing'}):
+            for token in invalid_tokens:
+                result = validate_admin_token(token)
+                self.assertFalse(result, f"Invalid token should be rejected: {token}")
+
+
 if __name__ == '__main__':
     unittest.main()

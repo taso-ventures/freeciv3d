@@ -14,11 +14,15 @@ import hashlib
 import os
 import gzip
 import math
+import threading
 from typing import Dict, Any, Optional, OrderedDict
 from dataclasses import dataclass
 from collections import OrderedDict
 
 logger = logging.getLogger("freeciv-proxy")
+
+# Configurable constants
+MAX_CITIES_FOR_OPTIMIZATION = int(os.getenv('MAX_CITIES_FOR_OPTIMIZATION', '5'))
 
 @dataclass
 class CacheEntry:
@@ -39,8 +43,11 @@ class StateCache:
     Optimizes game state queries to meet < 4KB and < 50ms requirements
     """
 
-    def __init__(self, ttl: int = 5, max_size_kb: int = 4, enable_compression: bool = True,
+    def __init__(self, ttl: int = None, max_size_kb: int = 4, enable_compression: bool = True,
                  max_cache_size_mb: int = 100, max_entries: int = 1000):
+        # Make TTL configurable via environment variable
+        if ttl is None:
+            ttl = int(os.getenv('CACHE_TTL_SECONDS', '5'))
         self.ttl = ttl  # Time-to-live in seconds
         self.max_size_bytes = max_size_kb * 1024  # Max size per entry
         self.max_cache_size_bytes = max_cache_size_mb * 1024 * 1024  # Max total cache size
@@ -54,6 +61,9 @@ class StateCache:
 
         # Use OrderedDict for efficient LRU operations
         self.cache: OrderedDict[str, CacheEntry] = OrderedDict()
+
+        # Thread safety lock for cache operations
+        self._lock = threading.RLock()
 
         # Performance metrics removed due to thread safety concerns
         # TODO: Add thread-safe metrics in future version
@@ -83,46 +93,47 @@ class StateCache:
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         """Get cached state with TTL and integrity check, updates LRU order"""
-        if key in self.cache:
-            entry = self.cache[key]
-            current_time = time.time()
+        with self._lock:
+            if key in self.cache:
+                entry = self.cache[key]
+                current_time = time.time()
 
-            if current_time - entry.timestamp < self.ttl:
-                # Verify cache integrity
-                if self._verify_cache_integrity(entry):
-                    # Cache hit (metrics removed for thread safety)
-                    entry.last_accessed = current_time
+                if current_time - entry.timestamp < self.ttl:
+                    # Verify cache integrity
+                    if self._verify_cache_integrity(entry):
+                        # Cache hit (metrics removed for thread safety)
+                        entry.last_accessed = current_time
 
-                    # Move to end for LRU (most recently used)
-                    self.cache.move_to_end(key)
+                        # Move to end for LRU (most recently used)
+                        self.cache.move_to_end(key)
 
-                    logger.debug(f"Cache hit for key: {key}")
+                        logger.debug(f"Cache hit for key: {key}")
 
-                    # Handle decompression if needed
-                    if entry.is_compressed and entry.compressed_data:
-                        try:
-                            decompressed_bytes = gzip.decompress(entry.compressed_data)
-                            return json.loads(decompressed_bytes.decode('utf-8'))
-                        except Exception as e:
-                            logger.error(f"Decompression failed for key {key}: {e}")
-                            self.cache.pop(key, None)
-                            return None
-                    
-                    return entry.data
-                
-                # Cache poisoning detected, remove entry
-                self.cache.pop(key, None)
-                logger.error(f"Cache integrity violation detected for key: {key}")
-                # Cache miss (metrics removed for thread safety)
-                return None
-            else:
-                # TTL expired, remove entry
-                self.cache.pop(key, None)
-                logger.debug(f"Cache entry expired for key: {key}")
+                        # Handle decompression if needed
+                        if entry.is_compressed and entry.compressed_data:
+                            try:
+                                decompressed_bytes = gzip.decompress(entry.compressed_data)
+                                return json.loads(decompressed_bytes.decode('utf-8'))
+                            except Exception as e:
+                                logger.error(f"Decompression failed for key {key}: {e}")
+                                self.cache.pop(key, None)
+                                return None
 
-        # Cache miss (metrics removed for thread safety)
-        logger.debug(f"Cache miss for key: {key}")
-        return None
+                        return entry.data
+
+                    # Cache poisoning detected, remove entry
+                    self.cache.pop(key, None)
+                    logger.error(f"Cache integrity violation detected for key: {key}")
+                    # Cache miss (metrics removed for thread safety)
+                    return None
+                else:
+                    # TTL expired, remove entry
+                    self.cache.pop(key, None)
+                    logger.debug(f"Cache entry expired for key: {key}")
+
+            # Cache miss (metrics removed for thread safety)
+            logger.debug(f"Cache miss for key: {key}")
+            return None
 
     def set(self, key: str, data: Dict[str, Any], player_id: int) -> bool:
         """Set cache with size validation"""
@@ -157,51 +168,53 @@ class StateCache:
             logger.warning(f"State too large for cache: {final_size} bytes (max: {self.max_size_bytes})")
             return False
 
-        # Check if we need to evict entries before adding
-        self._ensure_cache_capacity(final_size)
-
         # Generate HMAC signature for integrity
         signature = self._generate_signature(optimized, player_id, key)
         current_time = time.time()
 
-        # Store in cache with signature
-        entry = CacheEntry(
-            data=optimized if compressed_data is None else None,  # Store original data only if not compressed
-            timestamp=current_time,
-            size_bytes=final_size,
-            player_id=player_id,
-            cache_key=key,
-            signature=signature,
-            is_compressed=compressed_data is not None,
-            compressed_data=compressed_data,
-            last_accessed=current_time
-        )
+        # Store in cache with signature (thread-safe)
+        with self._lock:
+            # Check if we need to evict entries before adding
+            self._ensure_cache_capacity(final_size)
 
-        self.cache[key] = entry
-        # Move to end (most recently used)
-        self.cache.move_to_end(key)
+            entry = CacheEntry(
+                data=optimized if compressed_data is None else None,  # Store original data only if not compressed
+                timestamp=current_time,
+                size_bytes=final_size,
+                player_id=player_id,
+                cache_key=key,
+                signature=signature,
+                is_compressed=compressed_data is not None,
+                compressed_data=compressed_data,
+                last_accessed=current_time
+            )
+
+            self.cache[key] = entry
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
 
         logger.debug(f"Cached state for key: {key}, size: {final_size} bytes")
         return True
 
     def invalidate(self, pattern: str = None, player_id: int = None):
         """Invalidate cache entries matching pattern or player"""
-        keys_to_remove = []
+        with self._lock:
+            keys_to_remove = []
 
-        for key, entry in self.cache.items():
-            should_remove = False
+            for key, entry in self.cache.items():
+                should_remove = False
 
-            if pattern and pattern in key:
-                should_remove = True
-            elif player_id and entry.player_id == player_id:
-                should_remove = True
+                if pattern and pattern in key:
+                    should_remove = True
+                elif player_id and entry.player_id == player_id:
+                    should_remove = True
 
-            if should_remove:
-                keys_to_remove.append(key)
+                if should_remove:
+                    keys_to_remove.append(key)
 
-        for key in keys_to_remove:
-            self.cache.pop(key, None)
-            logger.debug(f"Invalidated cache entry: {key}")
+            for key in keys_to_remove:
+                self.cache.pop(key, None)
+                logger.debug(f"Invalidated cache entry: {key}")
 
     def optimize_state_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -235,7 +248,7 @@ class StateCache:
         # Compress cities - essential economic info
         if 'cities' in data and isinstance(data['cities'], list):
             optimized['cities'] = []
-            for city in data['cities'][:5]:  # Limit to 5 cities
+            for city in data['cities'][:MAX_CITIES_FOR_OPTIMIZATION]:
                 if isinstance(city, dict):
                     optimized['cities'].append({
                         'id': city.get('id'),
@@ -399,9 +412,10 @@ class StateCache:
 
     def clear(self):
         """Clear all cache entries"""
-        self.cache.clear()
-        # Metrics removed for thread safety
-        logger.info("Cache cleared")
+        with self._lock:
+            self.cache.clear()
+            # Metrics removed for thread safety
+            logger.info("Cache cleared")
 
 # Global cache instance
 state_cache = StateCache()

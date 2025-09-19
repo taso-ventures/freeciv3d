@@ -61,7 +61,7 @@ def validate_admin_token(provided_token: str) -> bool:
             admin_secret.encode('utf-8'),
             timestamp_str.encode('utf-8'),
             hashlib.sha256
-        ).hexdigest()[:16]  # First 16 chars for shorter token
+        ).hexdigest()  # Use full HMAC signature for security
 
         # Constant-time comparison
         return hmac.compare_digest(provided_signature, expected_signature)

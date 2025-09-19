@@ -10,6 +10,9 @@ import json
 import time
 import logging
 import os
+import atexit
+import signal
+import sys
 from enum import Enum
 from typing import Dict, Any, List, Optional, Union, Tuple
 from tornado import web
@@ -144,12 +147,32 @@ civcom_registry = CivComRegistry()
 _MAX_WORKERS = int(os.getenv('STATE_EXTRACTOR_THREADS', '4'))
 _shared_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="state-extractor")
 
+# Configurable constants for magic numbers
+MAX_TURN_NUMBER = int(os.getenv('MAX_TURN_NUMBER', '10000'))
+MAX_EXPANSION_SITES = int(os.getenv('MAX_EXPANSION_SITES', '5'))
+MAX_UNITS_ANALYZED = int(os.getenv('MAX_UNITS_ANALYZED', '5'))
+MAX_CITIES_ANALYZED = int(os.getenv('MAX_CITIES_ANALYZED', '5'))
+MAX_THREATS_RETURNED = int(os.getenv('MAX_THREATS_RETURNED', '5'))
+
 def shutdown_executor():
     """Shutdown the shared thread pool executor gracefully"""
     if _shared_executor:
         logger.info("Shutting down state extractor thread pool...")
         _shared_executor.shutdown(wait=True)
         logger.info("State extractor thread pool shutdown complete")
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_executor()
+    sys.exit(0)
+
+
+# Register shutdown handlers
+atexit.register(shutdown_executor)
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 
 def authenticate_request(request_handler, required_permission: str = 'state_read') -> Tuple[bool, Optional[int], Optional[str], str]:
@@ -676,7 +699,7 @@ class StateExtractor:
                     'threatened_units': len(nearby_friendlies)
                 })
 
-        return threats[:5]  # Top 5 threats only
+        return threats[:MAX_THREATS_RETURNED]
 
     def _get_exploration_opportunities(self, state: Dict[str, Any], player_id: int) -> List[Dict[str, int]]:
         """Get exploration opportunities (simplified)"""
@@ -714,9 +737,45 @@ class StateExtractor:
         return "developed" if total_pop > 20 else "developing" if total_pop > 10 else "early"
 
     def _get_expansion_sites(self, state: Dict[str, Any], player_id: int) -> int:
-        """Get number of potential expansion sites (simplified)"""
-        # Placeholder - would analyze map for suitable city sites
-        return 2
+        """Get number of potential expansion sites based on actual game data"""
+        try:
+            # Get actual map data if available
+            tiles = state.get('tiles', [])
+            existing_cities = state.get('cities', [])
+            player_units = [u for u in state.get('units', []) if u.get('owner') == player_id]
+
+            if not tiles:
+                # Fallback: estimate based on units and cities
+                num_cities = len([c for c in existing_cities if c.get('owner') == player_id])
+                num_settlers = len([u for u in player_units if u.get('type') == 'settler'])
+                return max(0, min(3, num_settlers + (3 - num_cities)))
+
+            # Analyze tiles for suitable city sites
+            suitable_sites = 0
+            city_positions = {(c['x'], c['y']) for c in existing_cities}
+
+            for tile in tiles:
+                x, y = tile.get('x', -1), tile.get('y', -1)
+                if x < 0 or y < 0:
+                    continue
+
+                # Check if tile is suitable for a city
+                terrain = tile.get('terrain', 'unknown')
+                if terrain in ['grassland', 'plains', 'hills']:
+                    # Check minimum distance from existing cities (at least 2 tiles)
+                    too_close = any(
+                        abs(x - cx) <= 2 and abs(y - cy) <= 2
+                        for cx, cy in city_positions
+                    )
+
+                    if not too_close:
+                        suitable_sites += 1
+
+            return min(suitable_sites, MAX_EXPANSION_SITES)
+
+        except Exception as e:
+            logger.warning(f"Error analyzing expansion sites: {e}")
+            return 2  # Conservative fallback
 
     def _build_cache_key(self, game_id: str, player_id: int, format_type: str, since_turn: Optional[int] = None) -> str:
         """Build cache key for state"""
@@ -726,57 +785,140 @@ class StateExtractor:
         return key
 
     def _simulate_previous_state(self, current_state: Dict[str, Any], since_turn: int) -> Dict[str, Any]:
-        """Simulate previous state for delta calculation (MVP implementation)"""
-        # For MVP, create a slightly modified version of current state
+        """Get previous state from game history or cache"""
+        # Try to get actual previous state from cache first
+        cache_key = f"state_{current_state.get('game_id', 'unknown')}_{current_state.get('player_id', 0)}_turn_{since_turn}"
+        cached_state = self.cache.get(cache_key)
+
+        if cached_state:
+            logger.debug(f"Retrieved previous state from cache for turn {since_turn}")
+            return cached_state
+
+        # If not in cache, try to get from civcom
+        try:
+            civcom = self._get_civcom_instance(current_state.get('game_id', ''))
+            if civcom and hasattr(civcom, 'get_turn_state'):
+                # Try to get historical state from game server
+                historical_state = civcom.get_turn_state(since_turn, current_state.get('player_id', 0))
+                if historical_state:
+                    logger.debug(f"Retrieved previous state from civcom for turn {since_turn}")
+                    return historical_state
+        except Exception as e:
+            logger.warning(f"Could not retrieve historical state: {e}")
+
+        # Fallback: Create reasonable approximation by removing recent changes
+        logger.debug(f"Using approximated previous state for turn {since_turn}")
         previous_state = current_state.copy()
         previous_state['turn'] = since_turn
 
-        # Simulate some unit movements
-        if 'units' in previous_state:
-            previous_state['units'] = []
-            for unit in current_state.get('units', []):
-                prev_unit = unit.copy()
-                # Simulate unit was at slightly different position
-                prev_unit['x'] = max(0, unit['x'] - 1)
-                prev_unit['y'] = max(0, unit['y'] - 1)
-                previous_state['units'].append(prev_unit)
+        # Remove units that might have been built recently (conservative approach)
+        if 'units' in previous_state and len(previous_state['units']) > 2:
+            previous_state['units'] = previous_state['units'][:-1]  # Remove newest unit
+
+        # Reduce city populations slightly (cities grow over time)
+        if 'cities' in previous_state:
+            for city in previous_state['cities']:
+                if city.get('population', 0) > 1:
+                    city['population'] = max(1, city['population'] - 1)
 
         return previous_state
 
     def _generate_legal_actions_from_state(self, state: Dict[str, Any], player_id: int) -> List[Dict[str, Any]]:
-        """Generate legal actions based on game state"""
+        """Generate legal actions based on actual game state from civcom"""
         actions = []
+
+        try:
+            # Get civcom instance for this game
+            civcom = self._get_civcom_instance(state.get('game_id', ''))
+            if civcom and hasattr(civcom, 'get_legal_actions'):
+                # Use actual civcom to generate legal actions
+                logger.debug("Getting legal actions from civcom")
+                legal_actions = civcom.get_legal_actions(player_id)
+                if legal_actions:
+                    return legal_actions
+
+        except Exception as e:
+            logger.warning(f"Could not get legal actions from civcom: {e}")
+
+        # Fallback: Generate actions based on available game entities
+        logger.debug("Using fallback action generation")
 
         # Get player's units and cities
         units = [u for u in state.get('units', []) if u.get('owner') == player_id]
         cities = [c for c in state.get('cities', []) if c.get('owner') == player_id]
 
-        # Generate unit movement actions
+        # Generate realistic unit movement actions (only if unit has moves left)
         for unit in units:
-            for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0)]:  # Adjacent tiles
-                actions.append({
-                    'type': 'unit_move',
-                    'unit_id': unit['id'],
-                    'target': {'x': unit['x'] + dx, 'y': unit['y'] + dy},
-                    'priority': 5 + (1 if unit.get('type') == 'settler' else 0)
-                })
+            if unit.get('moves_left', 0) > 0:
+                unit_type = unit.get('type', 'unknown')
+                # Check adjacent tiles for valid moves
+                for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1), (1, -1), (-1, 1)]:
+                    target_x, target_y = unit['x'] + dx, unit['y'] + dy
 
-        # Generate city production actions
+                    # Basic validity check (positive coordinates)
+                    if target_x >= 0 and target_y >= 0:
+                        actions.append({
+                            'type': 'unit_move',
+                            'unit_id': unit['id'],
+                            'source': {'x': unit['x'], 'y': unit['y']},
+                            'target': {'x': target_x, 'y': target_y},
+                            'cost': 1,
+                            'unit_type': unit_type,
+                            'priority': 5 + (2 if unit_type == 'settler' else 1 if unit_type == 'explorer' else 0)
+                        })
+
+        # Generate city production actions based on what cities can actually build
         for city in cities:
-            for production in ['warrior', 'settler', 'granary', 'barracks']:
+            city_size = city.get('population', 1)
+            # Larger cities can build more things
+            possible_units = ['warrior']
+            possible_buildings = ['granary']
+
+            if city_size >= 2:
+                possible_units.extend(['settler', 'worker'])
+                possible_buildings.append('barracks')
+
+            if city_size >= 3:
+                possible_units.append('archer')
+                possible_buildings.extend(['library', 'marketplace'])
+
+            for unit_type in possible_units:
                 actions.append({
-                    'type': 'city_production',
+                    'type': 'city_build_unit',
                     'city_id': city['id'],
-                    'target': production,
-                    'priority': 6 if production in ['settler', 'warrior'] else 4
+                    'target': unit_type,
+                    'cost': {'shields': 10 if unit_type == 'warrior' else 30},
+                    'priority': 6 if unit_type in ['settler', 'warrior'] else 4
                 })
 
-        # Generate research actions
-        available_techs = ['pottery', 'bronze_working', 'iron_working', 'writing']
+            for building in possible_buildings:
+                actions.append({
+                    'type': 'city_build_improvement',
+                    'city_id': city['id'],
+                    'target': building,
+                    'cost': {'shields': 20 if building == 'granary' else 40},
+                    'priority': 5
+                })
+
+        # Generate research actions based on current tech level
+        current_techs = state.get('technologies', [])
+        available_techs = []
+
+        # Basic tech tree progression
+        if 'pottery' not in current_techs:
+            available_techs.append('pottery')
+        if 'bronze_working' not in current_techs:
+            available_techs.append('bronze_working')
+        if 'pottery' in current_techs and 'writing' not in current_techs:
+            available_techs.append('writing')
+        if 'bronze_working' in current_techs and 'iron_working' not in current_techs:
+            available_techs.append('iron_working')
+
         for tech in available_techs:
             actions.append({
                 'type': 'research_tech',
                 'tech': tech,
+                'cost': {'beakers': 12},
                 'priority': 7
             })
 
@@ -800,14 +942,39 @@ class StateExtractorHandler(web.RequestHandler):
         """Handle GET requests for game state"""
         try:
             # Parse parameters
-            player_id = self.get_argument('player_id', None)
-            if player_id is None:
+            player_id_raw = self.get_argument('player_id', None)
+            if player_id_raw is None:
                 self.set_status(400)
                 self.write({"error": "player_id parameter is required"})
                 return
 
+            # Validate and sanitize inputs
+            try:
+                player_id = InputSanitizer.sanitize_player_id(player_id_raw)
+            except (ValueError, TypeError) as e:
+                self.set_status(400)
+                self.write({"error": f"Invalid player_id: {str(e)}"})
+                return
+
             format_str = self.get_argument('format', 'full')
             since_turn = self.get_argument('since_turn', None)
+
+            # Validate format parameter
+            if format_str not in ['full', 'minimal', 'llm']:
+                self.set_status(400)
+                self.write({"error": f"Invalid format '{format_str}'. Allowed: full, minimal, llm"})
+                return
+
+            # Validate since_turn parameter if provided
+            if since_turn is not None:
+                try:
+                    since_turn = int(since_turn)
+                    if since_turn < 0 or since_turn > MAX_TURN_NUMBER:
+                        raise ValueError("Turn number out of range")
+                except (ValueError, TypeError):
+                    self.set_status(400)
+                    self.write({"error": f"Invalid since_turn parameter. Must be integer 0-{MAX_TURN_NUMBER}"})
+                    return
 
             # Authenticate request
             authenticated, auth_player_id, auth_game_id, auth_error = authenticate_request(self, 'state_read')
@@ -862,6 +1029,11 @@ class StateExtractorHandler(web.RequestHandler):
             logger.warning(f"Validation error in StateExtractorHandler: {str(e)}")
             self.set_status(400)
             self.write({"error": "Invalid request parameters"})
+        except (ConnectionError, OSError, TimeoutError) as e:
+            # Network and connection errors
+            logger.error(f"Connection error in StateExtractorHandler: {str(e)}")
+            self.set_status(503)
+            self.write({"error": "Service temporarily unavailable", "retry": True})
         except Exception as e:
             error_message = str(e)
             logger.error(f"Error in StateExtractorHandler: {error_message}")
@@ -895,10 +1067,18 @@ class LegalActionsHandler(web.RequestHandler):
         """Handle GET requests for legal actions"""
         try:
             # Parse parameters
-            player_id = self.get_argument('player_id', None)
-            if player_id is None:
+            player_id_raw = self.get_argument('player_id', None)
+            if player_id_raw is None:
                 self.set_status(400)
                 self.write({"error": "player_id parameter is required"})
+                return
+
+            # Validate and sanitize inputs
+            try:
+                player_id = InputSanitizer.sanitize_player_id(player_id_raw)
+            except (ValueError, TypeError) as e:
+                self.set_status(400)
+                self.write({"error": f"Invalid player_id: {str(e)}"})
                 return
 
             # Authenticate request
@@ -948,6 +1128,11 @@ class LegalActionsHandler(web.RequestHandler):
             self.set_header("Content-Type", "application/json")
             self.write(actions)
 
+        except (ConnectionError, OSError, TimeoutError) as e:
+            # Network and connection errors
+            logger.error(f"Connection error in LegalActionsHandler: {str(e)}")
+            self.set_status(503)
+            self.write({"error": "Service temporarily unavailable", "retry": True})
         except Exception as e:
             error_message = str(e)
             logger.error(f"Error in LegalActionsHandler: {error_message}")
