@@ -44,6 +44,7 @@ dependencies="\
   python3-tornado \
   python3-pillow \
   python3-dotenv \
+  python3-redis \
   python3-dev \
   python3-wheel \
   sed \
