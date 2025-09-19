@@ -1,0 +1,357 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FreeCiv LLM WebSocket Protocol",
+  "description": "JSON Schema for FreeCiv LLM WebSocket messages",
+  "version": "1.0.0",
+
+  "definitions": {
+    "message_base": {
+      "type": "object",
+      "required": ["type", "agent_id", "timestamp", "data"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "llm_connect",
+            "llm_disconnect",
+            "state_query",
+            "state_update",
+            "action",
+            "action_result",
+            "turn_start",
+            "turn_end",
+            "spectator_update"
+          ]
+        },
+        "agent_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_-]+$"
+        },
+        "timestamp": {
+          "type": "number",
+          "minimum": 0
+        },
+        "data": {
+          "type": "object"
+        },
+        "correlation_id": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+
+    "coordinate": {
+      "type": "object",
+      "required": ["x", "y"],
+      "properties": {
+        "x": {"type": "integer", "minimum": 0},
+        "y": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
+
+  "messages": {
+    "llm_connect": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "llm_connect"},
+            "data": {
+              "type": "object",
+              "required": ["api_token", "model", "game_id"],
+              "properties": {
+                "api_token": {
+                  "type": "string",
+                  "minLength": 10,
+                  "maxLength": 256
+                },
+                "model": {
+                  "type": "string",
+                  "enum": ["gpt-4", "gpt-3.5-turbo", "claude-3", "claude-2", "deepseek-v2", "custom"]
+                },
+                "game_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "pattern": "^[a-zA-Z0-9_-]+$"
+                },
+                "capabilities": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": ["move", "build", "research", "diplomacy", "combat"]
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "auth_success": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "llm_connect"},
+            "data": {
+              "type": "object",
+              "required": ["type", "success", "agent_id", "session_id", "player_id"],
+              "properties": {
+                "type": {"const": "auth_success"},
+                "success": {"const": true},
+                "agent_id": {"type": "string"},
+                "session_id": {"type": "string"},
+                "player_id": {"type": "integer", "minimum": 1, "maximum": 8},
+                "game_id": {"type": "string"},
+                "model": {"type": "string"},
+                "capabilities": {
+                  "type": "array",
+                  "items": {"type": "string"}
+                },
+                "session_expires_in": {"type": "integer", "minimum": 0}
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "state_query": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "state_query"},
+            "data": {
+              "type": "object",
+              "required": ["format"],
+              "properties": {
+                "format": {
+                  "type": "string",
+                  "enum": ["full", "delta", "llm_optimized"]
+                },
+                "since_turn": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 10000
+                },
+                "include_legal_actions": {
+                  "type": "boolean",
+                  "default": true
+                },
+                "player_perspective": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "maximum": 8
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "state_update": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "state_update"},
+            "data": {
+              "type": "object",
+              "required": ["type", "format", "data"],
+              "properties": {
+                "type": {"const": "state_response"},
+                "format": {"type": "string"},
+                "data": {"type": "object"},
+                "cached": {"type": "boolean"},
+                "timestamp": {"type": "number"}
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+
+    "action": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "action"},
+            "data": {
+              "type": "object",
+              "required": ["action_type", "actor_id"],
+              "properties": {
+                "action_type": {
+                  "type": "string",
+                  "enum": [
+                    "unit_move",
+                    "unit_attack",
+                    "unit_build_city",
+                    "unit_explore",
+                    "city_production",
+                    "city_build_unit",
+                    "city_build_improvement",
+                    "tech_research",
+                    "diplomacy_message",
+                    "end_turn"
+                  ]
+                },
+                "actor_id": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "target": {
+                  "oneOf": [
+                    {"$ref": "#/definitions/coordinate"},
+                    {"type": "integer"},
+                    {"type": "string"},
+                    {"type": "object"}
+                  ]
+                },
+                "parameters": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "action_result": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "action_result"},
+            "data": {
+              "type": "object",
+              "required": ["type", "success"],
+              "properties": {
+                "type": {"const": "action_result"},
+                "success": {"type": "boolean"},
+                "action_type": {"type": "string"},
+                "error_code": {"type": "string"},
+                "error_message": {"type": "string"},
+                "result": {"type": "object"},
+                "state_change": {"type": "object"}
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "turn_start": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "turn_start"},
+            "data": {
+              "type": "object",
+              "required": ["turn", "phase"],
+              "properties": {
+                "turn": {"type": "integer", "minimum": 1},
+                "phase": {
+                  "type": "string",
+                  "enum": ["movement", "production", "research", "diplomacy"]
+                },
+                "time_limit": {"type": "integer", "minimum": 0},
+                "active_player": {"type": "integer", "minimum": 1, "maximum": 8}
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "turn_end": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "turn_end"},
+            "data": {
+              "type": "object",
+              "required": ["turn"],
+              "properties": {
+                "turn": {"type": "integer", "minimum": 1},
+                "next_player": {"type": "integer", "minimum": 1, "maximum": 8},
+                "turn_summary": {"type": "object"}
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "spectator_update": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "type": {"const": "spectator_update"},
+            "data": {
+              "type": "object",
+              "required": ["game_id", "update_type"],
+              "properties": {
+                "game_id": {"type": "string"},
+                "update_type": {
+                  "type": "string",
+                  "enum": ["player_action", "turn_change", "game_event", "state_change"]
+                },
+                "update_data": {"type": "object"}
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    },
+
+    "error": {
+      "allOf": [
+        {"$ref": "#/definitions/message_base"},
+        {
+          "properties": {
+            "data": {
+              "type": "object",
+              "required": ["type", "success", "error_code", "error_message"],
+              "properties": {
+                "type": {"const": "error"},
+                "success": {"const": false},
+                "error_code": {
+                  "type": "string",
+                  "pattern": "^E[0-9]{3}$"
+                },
+                "error_message": {"type": "string"},
+                "details": {"type": "object"}
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}
